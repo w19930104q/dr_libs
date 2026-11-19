@@ -110,8 +110,9 @@ Notes
 =====
 - dr_flac does not support changing the sample rate nor channel count mid stream.
 - dr_flac is not thread-safe, but its APIs can be called from any thread so long as you do your own synchronization.
-- When using Ogg encapsulation, a corrupted metadata block will result in `drflac_open_with_metadata()` and `drflac_open()` returning inconsistent samples due
-  to differences in corrupted stream recorvery logic between the two APIs.
+- When using Ogg encapsulation, `drflac_open_with_metadata()` and `drflac_open()` recover from corrupted metadata pages identically. Both
+  traverse the metadata pages through the Ogg read layer (which skips pages that fail their CRC check), so a given stream either opens and
+  yields identical samples from both APIs, or fails in both cases.
 */
 
 #ifndef dr_flac_h
@@ -849,10 +850,9 @@ the different metadata types.
 
 The STREAMINFO block must be present for this to succeed. Use `drflac_open_with_metadata_relaxed()` to open a FLAC stream where the header may not be present.
 
-Note that this will behave inconsistently with `drflac_open()` if the stream is an Ogg encapsulated stream and a metadata block is corrupted. This is due to
-the way the Ogg stream recovers from corrupted pages. When `drflac_open_with_metadata()` is being used, the open routine will try to read the contents of the
-metadata block, whereas `drflac_open()` will simply seek past it (for the sake of efficiency). This inconsistency can result in different samples being
-returned depending on whether or not the stream is being opened with metadata.
+For Ogg encapsulated streams this recovers from a corrupted metadata page exactly the same way as `drflac_open()`. Both APIs move past metadata block
+bodies through the Ogg read layer, which skips any page whose CRC check fails, so a given stream either opens and decodes identical samples from both
+APIs or fails in both cases. The behavior of native FLAC streams is unchanged.
 
 
 Seek Also
@@ -6817,7 +6817,70 @@ static drflac_bool32 drflac__resize_decoded_samples(drflac* pFlac, drflac_uint16
 }
 
 
-static drflac_result drflac__read_and_decode_metadata(drflac_read_proc onRead, drflac_seek_proc onSeek, drflac_tell_proc onTell, drflac_meta_proc onMeta, void* pUserData, void* pUserDataMD, drflac_uint64* pFirstFramePos, drflac_uint64* pSeektablePos, drflac_uint32* pSeekpointCount, drflac_allocation_callbacks* pAllocationCallbacks)
+/*
+Skip over a metadata block by reading and discarding rather than seeking.
+
+This is required for Ogg encapsulated streams. The Ogg layer uses different
+recovery policies depending on whether a page is consumed by a read
+(drflac__on_read_ogg, which recovers from CRC mismatches by skipping the bad
+page) or by a seek (drflac__on_seek_ogg, which fails on a CRC mismatch). When
+opening without metadata the block body is skipped with a seek, whereas opening
+with metadata reads the body, so a corrupted metadata page used to leave the
+two open paths positioned on different pages and return inconsistent samples.
+Reading and discarding here makes the no-metadata path traverse exactly the
+same pages as the metadata path so both APIs recover (or fail) identically.
+*/
+static drflac_result drflac__skip_block_by_reading(drflac_read_proc onRead, void* pUserData, drflac_uint32 blockSize)
+{
+    /*
+    A small stack buffer keeps this allocation-free. Block skipping is only ever
+    forward progress, so chunking does not change which Ogg pages are traversed.
+    */
+    drflac_uint8 scratch[256];
+    drflac_uint32 bytesRemaining = blockSize;
+
+    while (bytesRemaining > 0) {
+        drflac_uint32 bytesToRead = bytesRemaining;
+        size_t bytesRead;
+        if (bytesToRead > sizeof(scratch)) {
+            bytesToRead = (drflac_uint32)sizeof(scratch);
+        }
+
+        bytesRead = onRead(pUserData, scratch, bytesToRead);
+        if (bytesRead == 0) {
+            return DRFLAC_ERROR;    /* Hit the end of the stream (or an unrecoverable page). */
+        }
+
+        bytesRemaining -= (drflac_uint32)bytesRead;
+    }
+
+    return DRFLAC_SUCCESS;
+}
+
+/*
+Unified helper for moving forward over metadata bytes.
+
+For Ogg streams this reads and discards so every open path traverses the same Ogg pages (read callback = recover on a corrupted page). Native
+streams keep the cheaper seek, which also preserves the native malformed-metadata recovery logic in drflac_open_with_metadata_private().
+*/
+static drflac_result drflac__skip_metadata_bytes(drflac_read_proc onRead, drflac_seek_proc onSeek, drflac_bool32 isOgg, void* pUserData, drflac_uint32 bytes)
+{
+    if (bytes == 0) {
+        return DRFLAC_SUCCESS;
+    }
+
+    if (isOgg) {
+        return drflac__skip_block_by_reading(onRead, pUserData, bytes);
+    }
+
+    if (!onSeek(pUserData, bytes, DRFLAC_SEEK_CUR)) {
+        return DRFLAC_BAD_SEEK;
+    }
+
+    return DRFLAC_SUCCESS;
+}
+
+static drflac_result drflac__read_and_decode_metadata(drflac_read_proc onRead, drflac_seek_proc onSeek, drflac_tell_proc onTell, drflac_meta_proc onMeta, drflac_bool32 isOgg, void* pUserData, void* pUserDataMD, drflac_uint64* pFirstFramePos, drflac_uint64* pSeektablePos, drflac_uint32* pSeekpointCount, drflac_allocation_callbacks* pAllocationCallbacks)
 {
     /*
     We want to keep track of the byte position in the stream of the seektable. At the time of calling this function we know that
@@ -7313,8 +7376,9 @@ static drflac_result drflac__read_and_decode_metadata(drflac_read_proc onRead, d
                     } else
                 #endif
                     {
-                        /* Allocation failed. We need to seek past the picture data. */
-                        if (!onSeek(pUserData, metadata.data.picture.pictureDataSize, DRFLAC_SEEK_CUR)) {
+                        /* Allocation failed. We need to move past the picture data. */
+                        drflac_result skipResult = drflac__skip_metadata_bytes(onRead, onSeek, isOgg, pUserData, metadata.data.picture.pictureDataSize);
+                        if (skipResult != DRFLAC_SUCCESS) {
                             result = DRFLAC_ERROR;
                             goto done_flac;
                         }
@@ -7347,11 +7411,13 @@ static drflac_result drflac__read_and_decode_metadata(drflac_read_proc onRead, d
             case DRFLAC_METADATA_BLOCK_TYPE_PADDING:
             {
                 if (onMeta) {
+                    drflac_result skipResult;
                     metadata.data.padding.unused = 0;
 
                     /* Padding doesn't have anything meaningful in it, so just skip over it, but make sure the caller is aware of it by firing the callback. */
-                    if (!onSeek(pUserData, blockSize, DRFLAC_SEEK_CUR)) {
-                        return DRFLAC_BAD_SEEK;
+                    skipResult = drflac__skip_metadata_bytes(onRead, onSeek, isOgg, pUserData, blockSize);
+                    if (skipResult != DRFLAC_SUCCESS) {
+                        return skipResult;
                     } else {
                         onMeta(pUserDataMD, &metadata);
                     }
@@ -7377,8 +7443,9 @@ static drflac_result drflac__read_and_decode_metadata(drflac_read_proc onRead, d
                             return DRFLAC_ERROR;
                         }
                     } else {
-                        /* Allocation failed. We need to seek past the block. */
-                        if (!onSeek(pUserData, blockSize, DRFLAC_SEEK_CUR)) {
+                        /* Allocation failed. We need to move past the block. */
+                        drflac_result skipResult = drflac__skip_metadata_bytes(onRead, onSeek, isOgg, pUserData, blockSize);
+                        if (skipResult != DRFLAC_SUCCESS) {
                             return DRFLAC_ERROR;
                         }
                     }
@@ -7392,10 +7459,16 @@ static drflac_result drflac__read_and_decode_metadata(drflac_read_proc onRead, d
             } break;
         }
 
-        /* If we're not handling metadata, just skip over the block. If we are, it will have been handled earlier in the switch statement above. */
+        /*
+        If we're not handling metadata, just skip over the block. If we are, it will have been handled earlier in the switch statement above.
+
+        For Ogg streams the skip reads and discards rather than seeking, so every open path traverses the exact same Ogg pages and recovers
+        from corruption identically. Native streams keep the more efficient seek.
+        */
         if (onMeta == NULL && blockSize > 0) {
-            if (!onSeek(pUserData, blockSize, DRFLAC_SEEK_CUR)) {
-                return DRFLAC_BAD_SEEK;
+            drflac_result skipResult = drflac__skip_metadata_bytes(onRead, onSeek, isOgg, pUserData, blockSize);
+            if (skipResult != DRFLAC_SUCCESS) {
+                return skipResult;
             }
         }
 
@@ -8593,7 +8666,13 @@ static drflac* drflac_open_with_metadata_private(drflac_read_proc onRead, drflac
         }
 #endif
 
-        metadataResult = drflac__read_and_decode_metadata(onReadOverride, onSeekOverride, onTellOverride, onMeta, pUserDataOverride, pUserDataMD, &firstFramePos, &seektablePos, &seekpointCount, &allocationCallbacks);
+        {
+            drflac_bool32 isOggContainer = DRFLAC_FALSE;
+        #ifndef DR_FLAC_NO_OGG
+            isOggContainer = (init.container == drflac_container_ogg);
+        #endif
+            metadataResult = drflac__read_and_decode_metadata(onReadOverride, onSeekOverride, onTellOverride, onMeta, isOggContainer, pUserDataOverride, pUserDataMD, &firstFramePos, &seektablePos, &seekpointCount, &allocationCallbacks);
+        }
         if (metadataResult != DRFLAC_SUCCESS) {
             if (metadataResult == DRFLAC_INVALID_DATA && init.container == drflac_container_native && onSeek != NULL) {
                 /* An incorrect block length can consume audio. Search again from the end of STREAMINFO. */
