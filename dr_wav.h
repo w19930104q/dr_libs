@@ -288,8 +288,8 @@ typedef drwav_int32 drwav_result;
 #define DR_WAVE_FORMAT_EXTENSIBLE   0xFFFE
 
 /* Flags to pass into drwav_init_ex(), etc. */
-#define DRWAV_SEQUENTIAL            0x00000001
-#define DRWAV_WITH_METADATA         0x00000002
+#define DRWAV_SEQUENTIAL            0x00000001  /* Never perform a backwards seek while loading. Disables the chunk callback. */
+#define DRWAV_WITH_METADATA         0x00000002  /* Load metadata chunks into pWav->pMetadata. */
 
 DRWAV_API void drwav_version(drwav_uint32* pMajor, drwav_uint32* pMinor, drwav_uint32* pRevision);
 DRWAV_API const char* drwav_version_string(void);
@@ -984,7 +984,13 @@ to open the stream from a file or from a block of memory respectively.
 
 Possible values for flags:
   DRWAV_SEQUENTIAL: Never perform a backwards seek while loading. This disables the chunk callback and will cause this function
-                    to return as soon as the data chunk is found. Any chunks after the data chunk will be ignored.
+                    to return as soon as the data chunk is found. Any chunks after the data chunk will be ignored. When combined
+                    with DRWAV_WITH_METADATA, metadata chunks positioned before the data chunk are still captured and reported in
+                    pWav->pMetadata; they are buffered in memory while loading so the underlying stream only ever needs to support
+                    forward movement.
+  DRWAV_WITH_METADATA: Parse metadata chunks (such as "smpl", "cue ", "bext", "acid" and LIST/INFO) into pWav->pMetadata. In
+                    sequential mode only chunks before the data chunk can be reached; in non-sequential mode chunks anywhere in
+                    the file are considered.
 
 drwav_init() is equivalent to "drwav_init_ex(pWav, onRead, onSeek, NULL, pUserData, NULL, 0);".
 
@@ -2226,6 +2232,122 @@ DRWAV_PRIVATE size_t drwav__metadata_parser_read(drwav__metadata_parser* pParser
     }
 }
 
+
+/*
+Sequential mode cannot seek backwards, so the two-pass metadata parsing used in non-sequential mode (one pass to
+work out how much memory is required, and another pass to actually read the metadata) cannot be used directly on the
+stream. Instead, every chunk encountered before the data chunk that may produce metadata is buffered into a block of
+memory. The block is a plain concatenation of the on-disk chunk headers and their contents, so it can be re-parsed
+with the same two-pass parser using a simple in-memory read/seek backend which never touches the underlying stream.
+Only chunks positioned before the data chunk can be captured this way; anything after the data chunk is necessarily
+out of reach for sequential mode.
+*/
+typedef struct
+{
+    drwav_uint8* pData;
+    size_t dataSize;
+    size_t capacity;
+} drwav__sequential_metadata_buffer;
+
+typedef struct
+{
+    const drwav_uint8* pData;
+    size_t dataSize;
+    size_t cursor;
+} drwav__sequential_metadata_stream;
+
+DRWAV_PRIVATE size_t drwav__on_read_sequential_metadata(void* pUserData, void* pBufferOut, size_t bytesToRead)
+{
+    drwav__sequential_metadata_stream* pStream = (drwav__sequential_metadata_stream*)pUserData;
+    size_t bytesRemaining;
+
+    DRWAV_ASSERT(pStream != NULL);
+
+    bytesRemaining = pStream->dataSize - pStream->cursor;
+    if (bytesToRead > bytesRemaining) {
+        bytesToRead = bytesRemaining;
+    }
+
+    if (bytesToRead > 0) {
+        DRWAV_COPY_MEMORY(pBufferOut, pStream->pData + pStream->cursor, bytesToRead);
+        pStream->cursor += bytesToRead;
+    }
+
+    return bytesToRead;
+}
+
+DRWAV_PRIVATE drwav_bool32 drwav__on_seek_sequential_metadata(void* pUserData, int offset, drwav_seek_origin origin)
+{
+    drwav__sequential_metadata_stream* pStream = (drwav__sequential_metadata_stream*)pUserData;
+    drwav_int64 newCursor;
+
+    DRWAV_ASSERT(pStream != NULL);
+
+    if (origin == DRWAV_SEEK_SET) {
+        newCursor = 0;
+    } else if (origin == DRWAV_SEEK_CUR) {
+        newCursor = (drwav_int64)pStream->cursor;
+    } else if (origin == DRWAV_SEEK_END) {
+        newCursor = (drwav_int64)pStream->dataSize;
+    } else {
+        DRWAV_ASSERT(!"Invalid seek origin");
+        return DRWAV_FALSE;
+    }
+
+    newCursor += offset;
+
+    if (newCursor < 0 || (size_t)newCursor > pStream->dataSize) {
+        return DRWAV_FALSE;
+    }
+
+    pStream->cursor = (size_t)newCursor;
+    return DRWAV_TRUE;
+}
+
+DRWAV_PRIVATE drwav_bool32 drwav__sequential_metadata_buffer_append(drwav__sequential_metadata_buffer* pBuffer, const void* pData, size_t bytesToAppend, const drwav_allocation_callbacks* pAllocationCallbacks)
+{
+    size_t requiredCapacity;
+    size_t newCapacity;
+
+    if (bytesToAppend == 0) {
+        return DRWAV_TRUE;
+    }
+
+    /* Guard against overflow. */
+    if (bytesToAppend > DRWAV_SIZE_MAX - pBuffer->dataSize) {
+        return DRWAV_FALSE;
+    }
+
+    requiredCapacity = pBuffer->dataSize + bytesToAppend;
+    if (requiredCapacity <= pBuffer->capacity) {
+        DRWAV_COPY_MEMORY(pBuffer->pData + pBuffer->dataSize, pData, bytesToAppend);
+        pBuffer->dataSize = requiredCapacity;
+        return DRWAV_TRUE;
+    }
+
+    newCapacity = (pBuffer->capacity == 0) ? requiredCapacity : pBuffer->capacity;
+    while (newCapacity < requiredCapacity) {
+        if (newCapacity > DRWAV_SIZE_MAX / 2) {
+            newCapacity = requiredCapacity;  /* On the next iteration the loop will exit. */
+        } else {
+            newCapacity *= 2;
+        }
+    }
+
+    pBuffer->pData = (drwav_uint8*)drwav__realloc_from_callbacks(pBuffer->pData, newCapacity, pBuffer->capacity, pAllocationCallbacks);
+    if (pBuffer->pData == NULL) {
+        pBuffer->capacity = 0;
+        pBuffer->dataSize = 0;
+        return DRWAV_FALSE;
+    }
+
+    pBuffer->capacity = newCapacity;
+    DRWAV_COPY_MEMORY(pBuffer->pData + pBuffer->dataSize, pData, bytesToAppend);
+    pBuffer->dataSize = requiredCapacity;
+
+    return DRWAV_TRUE;
+}
+
 DRWAV_PRIVATE drwav_bool32 drwav__metadata_validate_smpl_chunk(const drwav_chunk_header* pChunkHeader, drwav_uint32 loopCount, drwav_uint32 samplerSpecificDataSizeInBytes, drwav_uint64* pTrailingDataSizeInBytes)
 {
     drwav_uint64 remainingDataSizeInBytes;
@@ -3129,6 +3251,98 @@ DRWAV_PRIVATE drwav_uint64 drwav__metadata_process_chunk(drwav__metadata_parser*
 }
 
 
+/*
+Parses the buffered chunks into the metadata objects held by pWav. This runs the same two-pass logic as
+non-sequential mode, but entirely in memory so no seek against the underlying stream is required. The buffer itself
+is owned by the caller and is not freed here.
+*/
+DRWAV_PRIVATE drwav_bool32 drwav__parse_sequential_metadata(drwav* pWav, drwav__sequential_metadata_buffer* pBuffer)
+{
+    drwav__sequential_metadata_stream stream;
+    drwav__metadata_parser metadataParser;
+    drwav_uint64 cursor = 0;
+    drwav_result result;
+
+    DRWAV_ZERO_MEMORY(&metadataParser, sizeof(metadataParser));
+
+    if (pBuffer->dataSize == 0) {
+        return DRWAV_TRUE;
+    }
+
+    stream.pData    = pBuffer->pData;
+    stream.dataSize = pBuffer->dataSize;
+    stream.cursor   = 0;
+
+    /* First pass: count metadata objects and work out how much memory is required. */
+    metadataParser.onRead            = drwav__on_read_sequential_metadata;
+    metadataParser.onSeek            = drwav__on_seek_sequential_metadata;
+    metadataParser.pReadSeekUserData = &stream;
+    metadataParser.stage             = drwav__metadata_parser_stage_count;
+
+    for (;;) {
+        drwav_chunk_header header;
+        drwav_uint64 metadataBytesRead;
+
+        result = drwav__read_chunk_header(metadataParser.onRead, metadataParser.pReadSeekUserData, pWav->container, &cursor, &header);
+        if (result != DRWAV_SUCCESS) {
+            break;
+        }
+
+        /*
+        process_chunk() reads part of the chunk contents while counting, so only the unread remainder (including
+        padding) needs to be skipped. This mirrors the second pass of non-sequential metadata loading and keeps the
+        in-memory stream positioned exactly at the next chunk header.
+        */
+        metadataBytesRead = drwav__metadata_process_chunk(&metadataParser, &header, drwav_metadata_type_all_including_unknown);
+
+        if (!drwav__seek_forward(metadataParser.onSeek, (header.sizeInBytes + header.paddingSize) - metadataBytesRead, metadataParser.pReadSeekUserData)) {
+            break;
+        }
+    }
+
+    if (metadataParser.metadataCount == 0) {
+        return DRWAV_TRUE;
+    }
+
+    /* Second pass: allocate and actually read the metadata. */
+    result = drwav__metadata_alloc(&metadataParser, &pWav->allocationCallbacks);
+    if (result != DRWAV_SUCCESS) {
+        return DRWAV_FALSE;
+    }
+
+    metadataParser.stage = drwav__metadata_parser_stage_read;
+    stream.cursor        = 0;
+    cursor               = 0;
+
+    for (;;) {
+        drwav_chunk_header header;
+        drwav_uint64 metadataBytesRead;
+
+        result = drwav__read_chunk_header(metadataParser.onRead, metadataParser.pReadSeekUserData, pWav->container, &cursor, &header);
+        if (result != DRWAV_SUCCESS) {
+            break;
+        }
+
+        metadataBytesRead = drwav__metadata_process_chunk(&metadataParser, &header, drwav_metadata_type_all_including_unknown);
+
+        if (metadataParser.metadataCursor == metadataParser.metadataCount) {
+            break;
+        }
+
+        if (!drwav__seek_forward(metadataParser.onSeek, (header.sizeInBytes + header.paddingSize) - metadataBytesRead, metadataParser.pReadSeekUserData)) {
+            drwav_free(metadataParser.pMetadata, &pWav->allocationCallbacks);
+            return DRWAV_FALSE;
+        }
+    }
+
+    /* Only return metadata objects that were fully parsed. */
+    pWav->pMetadata     = metadataParser.pMetadata;
+    pWav->metadataCount = (drwav_uint32)metadataParser.metadataCursor;
+
+    return DRWAV_TRUE;
+}
+
+
 DRWAV_PRIVATE drwav_uint32 drwav_get_bytes_per_pcm_frame(drwav* pWav)
 {
     drwav_uint32 bytesPerFrame;
@@ -3200,7 +3414,9 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     drwav_uint64 sampleCountFromFactChunk = 0;  /* Same as dataChunkSize - make sure this is the only place this is initialized to 0. */
     drwav_uint64 metadataStartPos;
     drwav__metadata_parser metadataParser;
+    drwav__sequential_metadata_buffer sequentialMetadataBuffer;
     drwav_bool8 isProcessingMetadata = DRWAV_FALSE;
+    drwav_bool8 isBufferingSequentialMetadata = DRWAV_FALSE;
     drwav_bool8 foundChunk_fmt  = DRWAV_FALSE;
     drwav_bool8 foundChunk_data = DRWAV_FALSE;
     drwav_bool8 isAIFCFormType = DRWAV_FALSE;   /* Only used with AIFF. */
@@ -3212,11 +3428,16 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     sequential = (flags & DRWAV_SEQUENTIAL) != 0;
 
     /*
-    Whether or not we are processing metadata controls how we load. We can load more efficiently when
-    metadata is not being processed. Seqential mode cannot support metadata because it involves seeking
-    backwards.
+    Whether or not we are processing metadata controls how we load. In non-sequential mode we do a two-pass parse
+    over the whole file which requires seeking backwards. Sequential mode cannot seek backwards, so instead the
+    contents of any metadata-bearing chunks found before the data chunk are buffered in memory and parsed in one go
+    once the data chunk has been found (see drwav__parse_sequential_metadata). Chunks after the data chunk cannot be
+    reached in sequential mode and are therefore always ignored.
     */
     isProcessingMetadata = !sequential && ((flags & DRWAV_WITH_METADATA) != 0);
+    isBufferingSequentialMetadata = sequential && ((flags & DRWAV_WITH_METADATA) != 0);
+
+    DRWAV_ZERO_MEMORY(&sequentialMetadataBuffer, sizeof(sequentialMetadataBuffer));
 
     /*
     When processing metadata we'll be doing some memory allocations here against untrusted data. We'll do
@@ -3405,6 +3626,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     /* Don't allow processing of metadata with untested containers. */
     if (pWav->container != drwav_container_riff && pWav->container != drwav_container_rf64) {
         isProcessingMetadata = DRWAV_FALSE;
+        isBufferingSequentialMetadata = DRWAV_FALSE;
     }
 
     DRWAV_ZERO_MEMORY(&metadataParser, sizeof(metadataParser));
@@ -3424,10 +3646,29 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     for (;;) {  /* For each chunk... */
         drwav_chunk_header header;
         drwav_uint64 chunkSize;
+        drwav_uint8 rawChunkHeader[8];   /* The on-disk chunk header. Used when buffering metadata in sequential mode. */
 
-        result = drwav__read_chunk_header(pWav->onRead, pWav->pUserData, pWav->container, &cursor, &header);
-        if (result != DRWAV_SUCCESS) {
-            break;
+        if (pWav->container == drwav_container_w64) {
+            /*
+            W64 chunk headers are 24 bytes, but sequential metadata is only buffered for the RIFF family so there is
+            no need to retain the raw header bytes for W64.
+            */
+            result = drwav__read_chunk_header(pWav->onRead, pWav->pUserData, pWav->container, &cursor, &header);
+            if (result != DRWAV_SUCCESS) {
+                break;
+            }
+        } else {
+            if (drwav__on_read(pWav->onRead, pWav->pUserData, rawChunkHeader, sizeof(rawChunkHeader), &cursor) != sizeof(rawChunkHeader)) {
+                break;
+            }
+
+            /* Parse the header from the retained bytes so it can also be stored in the sequential metadata buffer. */
+            header.id.fourcc[0] = rawChunkHeader[0];
+            header.id.fourcc[1] = rawChunkHeader[1];
+            header.id.fourcc[2] = rawChunkHeader[2];
+            header.id.fourcc[3] = rawChunkHeader[3];
+            header.sizeInBytes  = drwav_bytes_to_u32_ex(rawChunkHeader + 4, pWav->container);
+            header.paddingSize  = drwav__chunk_padding_size_riff(header.sizeInBytes);
         }
 
         chunkSize = header.sizeInBytes;
@@ -3806,16 +4047,59 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         }
 
 
-        /* Make sure we skip past the content of this chunk before we go to the next one. */
+        /*
+        Getting here means this is not a chunk handled explicitly above (such as "fmt ", "data" or "fact"), so it
+        is a candidate for metadata - including unknown chunks, exactly like in non-sequential mode.
+
+        In sequential mode with metadata enabled, buffer the chunk: the raw on-disk header is stored first, followed
+        by the contents and the padding byte, so the buffer can be re-parsed verbatim without ever seeking the
+        underlying stream backwards. This only ever moves the underlying stream forwards, so no backwards-seek
+        capability is required. Sequential metadata buffering is limited to the RIFF family for which rawChunkHeader
+        is the valid 8-byte on-disk header.
+        */
         chunkSize += header.paddingSize;    /* <-- Make sure we seek past the padding. */
-        if (drwav__seek_forward(pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
-            break;
+        if (isBufferingSequentialMetadata) {
+            drwav_uint64 bytesRemaining;
+
+            if (!drwav__sequential_metadata_buffer_append(&sequentialMetadataBuffer, rawChunkHeader, sizeof(rawChunkHeader), &pWav->allocationCallbacks)) {
+                drwav__free_from_callbacks(sequentialMetadataBuffer.pData, &pWav->allocationCallbacks);
+                return DRWAV_FALSE;
+            }
+
+            bytesRemaining = chunkSize;
+            while (bytesRemaining > 0) {
+                drwav_uint8 temp[4096];
+                size_t bytesToRead = (bytesRemaining > sizeof(temp)) ? sizeof(temp) : (size_t)bytesRemaining;
+                size_t bytesJustRead = pWav->onRead(pWav->pUserData, temp, bytesToRead);
+
+                if (bytesJustRead == 0) {
+                    break;
+                }
+
+                if (!drwav__sequential_metadata_buffer_append(&sequentialMetadataBuffer, temp, bytesJustRead, &pWav->allocationCallbacks)) {
+                    drwav__free_from_callbacks(sequentialMetadataBuffer.pData, &pWav->allocationCallbacks);
+                    return DRWAV_FALSE;
+                }
+
+                bytesRemaining -= bytesJustRead;
+                cursor += bytesJustRead;
+            }
+
+            if (bytesRemaining != 0) {
+                break;  /* Hit the end of the stream before the end of the chunk. */
+            }
+        } else {
+            if (drwav__seek_forward(pWav->onSeek, chunkSize, pWav->pUserData) == DRWAV_FALSE) {
+                break;
+            }
+            cursor += chunkSize;
         }
-        cursor += chunkSize;
     }
 
     /* There's some mandatory chunks that must exist. If they were not found in the iteration above we must abort. */
     if (!foundChunk_fmt || !foundChunk_data) {
+        /* The chunk loop may have exited via a break (such as an unexpected end of stream inside a buffered chunk), so release anything buffered. */
+        drwav__free_from_callbacks(sequentialMetadataBuffer.pData, &pWav->allocationCallbacks);
         return DRWAV_FALSE;
     }
 
@@ -3824,6 +4108,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         (fmt.channels      == 0 || fmt.channels      > DRWAV_MAX_CHANNELS       ) ||
         (fmt.bitsPerSample == 0 || fmt.bitsPerSample > DRWAV_MAX_BITS_PER_SAMPLE) ||
         fmt.blockAlign == 0) {
+        drwav__free_from_callbacks(sequentialMetadataBuffer.pData, &pWav->allocationCallbacks);
         return DRWAV_FALSE; /* Probably an invalid WAV file. */
     }
 
@@ -3891,6 +4176,24 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         /* Only return metadata objects that were fully parsed. */
         pWav->pMetadata     = metadataParser.pMetadata;
         pWav->metadataCount = (drwav_uint32)metadataParser.metadataCursor;
+    }
+
+    /*
+    Sequential mode: parse the chunks that were buffered while scanning forwards up to the data chunk. This runs
+    entirely in memory and therefore does not require the underlying stream to support backwards seeking. The
+    buffer is released here immediately afterwards; on the failure paths above it is released by those return blocks.
+    */
+    if (isBufferingSequentialMetadata) {
+        drwav_bool32 metadataResult = drwav__parse_sequential_metadata(pWav, &sequentialMetadataBuffer);
+        drwav__free_from_callbacks(sequentialMetadataBuffer.pData, &pWav->allocationCallbacks);
+        sequentialMetadataBuffer.pData    = NULL;
+        sequentialMetadataBuffer.dataSize = 0;
+        sequentialMetadataBuffer.capacity = 0;
+
+        if (!metadataResult) {
+            drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
+            return DRWAV_FALSE;
+        }
     }
 
     /*
