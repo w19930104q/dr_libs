@@ -79,7 +79,7 @@ dr_wav can also be used to output WAV files. This does not currently support com
     drwav_uint64 framesWritten = drwav_write_pcm_frames(pWav, frameCount, pSamples);
     ```
 
-Note that writing to AIFF or RIFX is not supported.
+Note that writing to AIFF is not supported. RIFX is supported for writing, but is big-endian encoded.
 
 dr_wav has support for decoding from a number of different encapsulation formats. See below for details.
 
@@ -106,7 +106,7 @@ Supported Encapsulations
 - RF64
 - W64
 
-Note that AIFF and RIFX do not support write mode, nor do they support reading of metadata.
+Note that AIFF does not support write mode. In addition, neither AIFF nor RIFX support reading of metadata.
 
 
 Supported Encodings
@@ -1117,8 +1117,9 @@ Writes PCM frames.
 
 Returns the number of PCM frames written.
 
-Input samples need to be in native-endian byte order. On big-endian architectures the input data will be converted to
-little-endian. Use drwav_write_raw() to write raw audio data without performing any conversion.
+Input samples need to be in native-endian byte order. The data will be converted to the byte order of the container
+(little-endian for RIFF/RF64/W64, big-endian for RIFX/AIFF) as required. Use drwav_write_raw() to write raw audio data
+without performing any conversion.
 */
 DRWAV_API drwav_uint64 drwav_write_pcm_frames(drwav* pWav, drwav_uint64 framesToWrite, const void* pData);
 DRWAV_API drwav_uint64 drwav_write_pcm_frames_le(drwav* pWav, drwav_uint64 framesToWrite, const void* pData);
@@ -1952,7 +1953,7 @@ DRWAV_PRIVATE unsigned int drwav__chunk_padding_size_w64(drwav_uint64 chunkSize)
 
 DRWAV_PRIVATE unsigned int drwav_calculate_padding_size(drwav_container container, drwav_uint64 chunkSize)
 {
-    if (container == drwav_container_riff || container == drwav_container_rf64) {
+    if (container == drwav_container_riff || container == drwav_container_rifx || container == drwav_container_rf64) {
         return drwav__chunk_padding_size_riff(chunkSize);
     } else {
         return drwav__chunk_padding_size_w64(chunkSize);
@@ -4144,6 +4145,79 @@ DRWAV_PRIVATE size_t drwav__write_f32ne_to_le(drwav* pWav, float value)
     return drwav__write(pWav, &u.u32, 4);
 }
 
+DRWAV_PRIVATE size_t drwav__write_u16ne_to_be(drwav* pWav, drwav_uint16 value)
+{
+    DRWAV_ASSERT(pWav          != NULL);
+    DRWAV_ASSERT(pWav->onWrite != NULL);
+
+    if (drwav__is_little_endian()) {
+        value = drwav__bswap16(value);
+    }
+
+    return drwav__write(pWav, &value, 2);
+}
+
+DRWAV_PRIVATE size_t drwav__write_u32ne_to_be(drwav* pWav, drwav_uint32 value)
+{
+    DRWAV_ASSERT(pWav          != NULL);
+    DRWAV_ASSERT(pWav->onWrite != NULL);
+
+    if (drwav__is_little_endian()) {
+        value = drwav__bswap32(value);
+    }
+
+    return drwav__write(pWav, &value, 4);
+}
+
+DRWAV_PRIVATE size_t drwav__write_f32ne_to_be(drwav* pWav, float value)
+{
+    union {
+       drwav_uint32 u32;
+       float f32;
+    } u;
+
+    DRWAV_ASSERT(pWav          != NULL);
+    DRWAV_ASSERT(pWav->onWrite != NULL);
+
+    u.f32 = value;
+
+    if (drwav__is_little_endian()) {
+        u.u32 = drwav__bswap32(u.u32);
+    }
+
+    return drwav__write(pWav, &u.u32, 4);
+}
+
+/* Writes a 16-bit value using the byte order of the given container. Only valid for RIFF, RIFX and RF64. */
+DRWAV_PRIVATE size_t drwav__write_u16ne_to_ex(drwav* pWav, drwav_container container, drwav_uint16 value)
+{
+    if (drwav_is_container_be(container)) {
+        return drwav__write_u16ne_to_be(pWav, value);
+    }
+
+    return drwav__write_u16ne_to_le(pWav, value);
+}
+
+/* Writes a 32-bit value using the byte order of the given container. Only valid for RIFF, RIFX and RF64. */
+DRWAV_PRIVATE size_t drwav__write_u32ne_to_ex(drwav* pWav, drwav_container container, drwav_uint32 value)
+{
+    if (drwav_is_container_be(container)) {
+        return drwav__write_u32ne_to_be(pWav, value);
+    }
+
+    return drwav__write_u32ne_to_le(pWav, value);
+}
+
+/* Writes a 32-bit float using the byte order of the given container. Only valid for RIFF, RIFX and RF64. */
+DRWAV_PRIVATE size_t drwav__write_f32ne_to_ex(drwav* pWav, drwav_container container, float value)
+{
+    if (drwav_is_container_be(container)) {
+        return drwav__write_f32ne_to_be(pWav, value);
+    }
+
+    return drwav__write_f32ne_to_le(pWav, value);
+}
+
 DRWAV_PRIVATE size_t drwav__write_or_count(drwav* pWav, const void* pData, size_t dataSize)
 {
     if (pWav == NULL) {
@@ -4162,24 +4236,6 @@ DRWAV_PRIVATE size_t drwav__write_or_count_byte(drwav* pWav, drwav_uint8 byte)
     return drwav__write_byte(pWav, byte);
 }
 
-DRWAV_PRIVATE size_t drwav__write_or_count_u16ne_to_le(drwav* pWav, drwav_uint16 value)
-{
-    if (pWav == NULL) {
-        return 2;
-    }
-
-    return drwav__write_u16ne_to_le(pWav, value);
-}
-
-DRWAV_PRIVATE size_t drwav__write_or_count_u32ne_to_le(drwav* pWav, drwav_uint32 value)
-{
-    if (pWav == NULL) {
-        return 4;
-    }
-
-    return drwav__write_u32ne_to_le(pWav, value);
-}
-
 #if 0   /* Unused for now. */
 DRWAV_PRIVATE size_t drwav__write_or_count_u64ne_to_le(drwav* pWav, drwav_uint64 value)
 {
@@ -4191,13 +4247,34 @@ DRWAV_PRIVATE size_t drwav__write_or_count_u64ne_to_le(drwav* pWav, drwav_uint64
 }
 #endif
 
-DRWAV_PRIVATE size_t drwav__write_or_count_f32ne_to_le(drwav* pWav, float value)
+/* pWav can be NULL meaning just count the bytes that would be written. */
+DRWAV_PRIVATE size_t drwav__write_or_count_u16ne_to_ex(drwav* pWav, drwav_container container, drwav_uint16 value)
+{
+    if (pWav == NULL) {
+        return 2;
+    }
+
+    return drwav__write_u16ne_to_ex(pWav, container, value);
+}
+
+/* pWav can be NULL meaning just count the bytes that would be written. */
+DRWAV_PRIVATE size_t drwav__write_or_count_u32ne_to_ex(drwav* pWav, drwav_container container, drwav_uint32 value)
 {
     if (pWav == NULL) {
         return 4;
     }
 
-    return drwav__write_f32ne_to_le(pWav, value);
+    return drwav__write_u32ne_to_ex(pWav, container, value);
+}
+
+/* pWav can be NULL meaning just count the bytes that would be written. */
+DRWAV_PRIVATE size_t drwav__write_or_count_f32ne_to_ex(drwav* pWav, drwav_container container, float value)
+{
+    if (pWav == NULL) {
+        return 4;
+    }
+
+    return drwav__write_f32ne_to_ex(pWav, container, value);
 }
 
 DRWAV_PRIVATE size_t drwav__write_or_count_string_to_fixed_size_buf(drwav* pWav, char* str, size_t bufFixedSize)
@@ -4223,7 +4300,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_string_to_fixed_size_buf(drwav* pWav,
 
 
 /* pWav can be NULL meaning just count the bytes that would be written. */
-DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata* pMetadatas, drwav_uint32 metadataCount)
+DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_container container, drwav_metadata* pMetadatas, drwav_uint32 metadataCount)
 {
     size_t bytesWritten = 0;
     drwav_bool32 hasListAdtl = DRWAV_FALSE;
@@ -4254,25 +4331,25 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                 chunkSize = DRWAV_SMPL_BYTES + DRWAV_SMPL_LOOP_BYTES * pMetadata->data.smpl.sampleLoopCount + pMetadata->data.smpl.samplerSpecificDataSizeInBytes;
 
                 bytesWritten += drwav__write_or_count(pWav, "smpl", 4);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, chunkSize);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, chunkSize);
 
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.manufacturerId);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.productId);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.samplePeriodNanoseconds);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.midiUnityNote);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.midiPitchFraction);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.smpteFormat);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.smpteOffset);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.sampleLoopCount);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.samplerSpecificDataSizeInBytes);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.manufacturerId);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.productId);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.samplePeriodNanoseconds);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.midiUnityNote);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.midiPitchFraction);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.smpteFormat);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.smpteOffset);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.sampleLoopCount);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.samplerSpecificDataSizeInBytes);
 
                 for (iLoop = 0; iLoop < pMetadata->data.smpl.sampleLoopCount; ++iLoop) {
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.pLoops[iLoop].cuePointId);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.pLoops[iLoop].type);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.pLoops[iLoop].firstSampleOffset);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.pLoops[iLoop].lastSampleOffset);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.pLoops[iLoop].sampleFraction);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.smpl.pLoops[iLoop].playCount);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.pLoops[iLoop].cuePointId);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.pLoops[iLoop].type);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.pLoops[iLoop].firstSampleOffset);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.pLoops[iLoop].lastSampleOffset);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.pLoops[iLoop].sampleFraction);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.smpl.pLoops[iLoop].playCount);
                 }
 
                 if (pMetadata->data.smpl.samplerSpecificDataSizeInBytes > 0) {
@@ -4285,7 +4362,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                 chunkSize = DRWAV_INST_BYTES;
 
                 bytesWritten += drwav__write_or_count(pWav, "inst", 4);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, chunkSize);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, chunkSize);
                 bytesWritten += drwav__write_or_count(pWav, &pMetadata->data.inst.midiUnityNote, 1);
                 bytesWritten += drwav__write_or_count(pWav, &pMetadata->data.inst.fineTuneCents, 1);
                 bytesWritten += drwav__write_or_count(pWav, &pMetadata->data.inst.gainDecibels, 1);
@@ -4302,15 +4379,15 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                 chunkSize = DRWAV_CUE_BYTES + DRWAV_CUE_POINT_BYTES * pMetadata->data.cue.cuePointCount;
 
                 bytesWritten += drwav__write_or_count(pWav, "cue ", 4);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, chunkSize);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.cue.cuePointCount);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, chunkSize);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.cue.cuePointCount);
                 for (iCuePoint = 0; iCuePoint < pMetadata->data.cue.cuePointCount; ++iCuePoint) {
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.cue.pCuePoints[iCuePoint].id);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.cue.pCuePoints[iCuePoint].playOrderPosition);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.cue.pCuePoints[iCuePoint].id);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.cue.pCuePoints[iCuePoint].playOrderPosition);
                     bytesWritten += drwav__write_or_count(pWav, pMetadata->data.cue.pCuePoints[iCuePoint].dataChunkId, 4);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.cue.pCuePoints[iCuePoint].chunkStart);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.cue.pCuePoints[iCuePoint].blockStart);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.cue.pCuePoints[iCuePoint].sampleOffset);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.cue.pCuePoints[iCuePoint].chunkStart);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.cue.pCuePoints[iCuePoint].blockStart);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.cue.pCuePoints[iCuePoint].sampleOffset);
                 }
             } break;
 
@@ -4319,15 +4396,15 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                 chunkSize = DRWAV_ACID_BYTES;
 
                 bytesWritten += drwav__write_or_count(pWav, "acid", 4);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, chunkSize);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.acid.flags);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.acid.midiUnityNote);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.acid.reserved1);
-                bytesWritten += drwav__write_or_count_f32ne_to_le(pWav, pMetadata->data.acid.reserved2);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.acid.numBeats);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.acid.meterDenominator);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.acid.meterNumerator);
-                bytesWritten += drwav__write_or_count_f32ne_to_le(pWav, pMetadata->data.acid.tempo);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, chunkSize);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.acid.flags);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.acid.midiUnityNote);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.acid.reserved1);
+                bytesWritten += drwav__write_or_count_f32ne_to_ex(pWav, container, pMetadata->data.acid.reserved2);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.acid.numBeats);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.acid.meterDenominator);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.acid.meterNumerator);
+                bytesWritten += drwav__write_or_count_f32ne_to_ex(pWav, container, pMetadata->data.acid.tempo);
             } break;
 
             case drwav_metadata_type_bext:
@@ -4339,7 +4416,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                 chunkSize = DRWAV_BEXT_BYTES + pMetadata->data.bext.codingHistorySize;
 
                 bytesWritten += drwav__write_or_count(pWav, "bext", 4);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, chunkSize);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, chunkSize);
 
                 bytesWritten += drwav__write_or_count_string_to_fixed_size_buf(pWav, pMetadata->data.bext.pDescription, DRWAV_BEXT_DESCRIPTION_BYTES);
                 bytesWritten += drwav__write_or_count_string_to_fixed_size_buf(pWav, pMetadata->data.bext.pOriginatorName, DRWAV_BEXT_ORIGINATOR_NAME_BYTES);
@@ -4349,16 +4426,16 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
 
                 timeReferenceLow  = (drwav_uint32)(pMetadata->data.bext.timeReference & 0xFFFFFFFF);
                 timeReferenceHigh = (drwav_uint32)(pMetadata->data.bext.timeReference >> 32);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, timeReferenceLow);
-                bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, timeReferenceHigh);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, timeReferenceLow);
+                bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, timeReferenceHigh);
 
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.bext.version);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.bext.version);
                 bytesWritten += drwav__write_or_count(pWav, pMetadata->data.bext.pUMID, DRWAV_BEXT_UMID_BYTES);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.bext.loudnessValue);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.bext.loudnessRange);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.bext.maxTruePeakLevel);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.bext.maxMomentaryLoudness);
-                bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.bext.maxShortTermLoudness);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.bext.loudnessValue);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.bext.loudnessRange);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.bext.maxTruePeakLevel);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.bext.maxMomentaryLoudness);
+                bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.bext.maxShortTermLoudness);
 
                 DRWAV_ZERO_MEMORY(reservedBuf, sizeof(reservedBuf));
                 bytesWritten += drwav__write_or_count(pWav, reservedBuf, sizeof(reservedBuf));
@@ -4374,7 +4451,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                     chunkSize = pMetadata->data.unknown.dataSizeInBytes;
 
                     bytesWritten += drwav__write_or_count(pWav, pMetadata->data.unknown.id, 4);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, chunkSize);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, chunkSize);
                     bytesWritten += drwav__write_or_count(pWav, pMetadata->data.unknown.pData, pMetadata->data.unknown.dataSizeInBytes);
                 }
             } break;
@@ -4405,7 +4482,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
         }
 
         bytesWritten += drwav__write_or_count(pWav, "LIST", 4);
-        bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, chunkSize);
+        bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, chunkSize);
         bytesWritten += drwav__write_or_count(pWav, "INFO", 4);
 
         for (iMetadata = 0; iMetadata < metadataCount; ++iMetadata) {
@@ -4438,7 +4515,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                 if (pMetadata->data.infoText.stringLength) {
                     subchunkSize = pMetadata->data.infoText.stringLength + 1;
                     bytesWritten += drwav__write_or_count(pWav, pID, 4);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, subchunkSize);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, subchunkSize);
                     bytesWritten += drwav__write_or_count(pWav, pMetadata->data.infoText.pString, pMetadata->data.infoText.stringLength);
                     bytesWritten += drwav__write_or_count_byte(pWav, '\0');
                 }
@@ -4447,7 +4524,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                     subchunkSize = pMetadata->data.unknown.dataSizeInBytes;
 
                     bytesWritten += drwav__write_or_count(pWav, pMetadata->data.unknown.id, 4);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.unknown.dataSizeInBytes);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.unknown.dataSizeInBytes);
                     bytesWritten += drwav__write_or_count(pWav, pMetadata->data.unknown.pData, subchunkSize);
                 }
             }
@@ -4504,7 +4581,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
         }
 
         bytesWritten += drwav__write_or_count(pWav, "LIST", 4);
-        bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, chunkSize);
+        bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, chunkSize);
         bytesWritten += drwav__write_or_count(pWav, "adtl", 4);
 
         for (iMetadata = 0; iMetadata < metadataCount; ++iMetadata) {
@@ -4533,9 +4610,9 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
 
                         bytesWritten += drwav__write_or_count(pWav, pID, 4);
                         subchunkSize += pMetadata->data.labelOrNote.stringLength + 1;
-                        bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, subchunkSize);
+                        bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, subchunkSize);
 
-                        bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.labelOrNote.cuePointId);
+                        bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.labelOrNote.cuePointId);
                         bytesWritten += drwav__write_or_count(pWav, pMetadata->data.labelOrNote.pString, pMetadata->data.labelOrNote.stringLength);
                         bytesWritten += drwav__write_or_count_byte(pWav, '\0');
                     }
@@ -4549,14 +4626,14 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
                     if (pMetadata->data.labelledCueRegion.stringLength > 0) {
                         subchunkSize += pMetadata->data.labelledCueRegion.stringLength + 1;
                     }
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, subchunkSize);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.labelledCueRegion.cuePointId);
-                    bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, pMetadata->data.labelledCueRegion.sampleLength);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, subchunkSize);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.labelledCueRegion.cuePointId);
+                    bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, pMetadata->data.labelledCueRegion.sampleLength);
                     bytesWritten += drwav__write_or_count(pWav, pMetadata->data.labelledCueRegion.purposeId, 4);
-                    bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.labelledCueRegion.country);
-                    bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.labelledCueRegion.language);
-                    bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.labelledCueRegion.dialect);
-                    bytesWritten += drwav__write_or_count_u16ne_to_le(pWav, pMetadata->data.labelledCueRegion.codePage);
+                    bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.labelledCueRegion.country);
+                    bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.labelledCueRegion.language);
+                    bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.labelledCueRegion.dialect);
+                    bytesWritten += drwav__write_or_count_u16ne_to_ex(pWav, container, pMetadata->data.labelledCueRegion.codePage);
 
                     if (pMetadata->data.labelledCueRegion.stringLength > 0) {
                         DRWAV_ASSERT(pMetadata->data.labelledCueRegion.pString != NULL);
@@ -4573,7 +4650,7 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
 
                         DRWAV_ASSERT(pMetadata->data.unknown.pData != NULL);
                         bytesWritten += drwav__write_or_count(pWav, pMetadata->data.unknown.id, 4);
-                        bytesWritten += drwav__write_or_count_u32ne_to_le(pWav, subchunkSize);
+                        bytesWritten += drwav__write_or_count_u32ne_to_ex(pWav, container, subchunkSize);
                         bytesWritten += drwav__write_or_count(pWav, pMetadata->data.unknown.pData, subchunkSize);
                     }
                 } break;
@@ -4592,9 +4669,9 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
     return bytesWritten;
 }
 
-DRWAV_PRIVATE drwav_uint32 drwav__riff_chunk_size_riff(drwav_uint64 dataChunkSize, drwav_metadata* pMetadata, drwav_uint32 metadataCount)
+DRWAV_PRIVATE drwav_uint32 drwav__riff_chunk_size_riff(drwav_container container, drwav_uint64 dataChunkSize, drwav_metadata* pMetadata, drwav_uint32 metadataCount)
 {
-    drwav_uint64 chunkSize = 4 + 24 + (drwav_uint64)drwav__write_or_count_metadata(NULL, pMetadata, metadataCount) + 8 + dataChunkSize + drwav__chunk_padding_size_riff(dataChunkSize); /* 4 = "WAVE". 24 = "fmt " chunk. 8 = "data" + u32 data size. */
+    drwav_uint64 chunkSize = 4 + 24 + (drwav_uint64)drwav__write_or_count_metadata(NULL, container, pMetadata, metadataCount) + 8 + dataChunkSize + drwav__chunk_padding_size_riff(dataChunkSize); /* 4 = "WAVE". 24 = "fmt " chunk. 8 = "data" + u32 data size. */
     if (chunkSize > 0xFFFFFFFFUL) {
         chunkSize = 0xFFFFFFFFUL;
     }
@@ -4625,7 +4702,7 @@ DRWAV_PRIVATE drwav_uint64 drwav__data_chunk_size_w64(drwav_uint64 dataChunkSize
 
 DRWAV_PRIVATE drwav_uint64 drwav__riff_chunk_size_rf64(drwav_uint64 dataChunkSize, drwav_metadata *metadata, drwav_uint32 numMetadata)
 {
-    drwav_uint64 chunkSize = 4 + 36 + 24 + (drwav_uint64)drwav__write_or_count_metadata(NULL, metadata, numMetadata) + 8 + dataChunkSize + drwav__chunk_padding_size_riff(dataChunkSize); /* 4 = "WAVE". 36 = "ds64" chunk. 24 = "fmt " chunk. 8 = "data" + u32 data size. */
+    drwav_uint64 chunkSize = 4 + 36 + 24 + (drwav_uint64)drwav__write_or_count_metadata(NULL, drwav_container_rf64, metadata, numMetadata) + 8 + dataChunkSize + drwav__chunk_padding_size_riff(dataChunkSize); /* 4 = "WAVE". 36 = "ds64" chunk. 24 = "fmt " chunk. 8 = "data" + u32 data size. */
     if (chunkSize > 0xFFFFFFFFUL) {
         chunkSize = 0xFFFFFFFFUL;
     }
@@ -4698,10 +4775,10 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_write__internal(drwav* pWav, const drwav_d
         initialDataChunkSize = (totalSampleCount * pWav->fmt.bitsPerSample) / 8;
 
         /*
-        The RIFF container has a limit on the number of samples. drwav is not allowing this. There's no practical limits for Wave64
-        so for the sake of simplicity I'm not doing any validation for that.
+        The RIFF and RIFX containers have a limit on the number of samples. drwav is not allowing this. There's no practical limits
+        for Wave64 so for the sake of simplicity I'm not doing any validation for that.
         */
-        if (pFormat->container == drwav_container_riff) {
+        if (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rifx) {
             if (initialDataChunkSize > (0xFFFFFFFFUL - 36)) {
                 return DRWAV_FALSE; /* Not enough room to store every sample. */
             }
@@ -4711,11 +4788,11 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_write__internal(drwav* pWav, const drwav_d
     pWav->dataChunkDataSizeTargetWrite = initialDataChunkSize;
 
 
-    /* "RIFF" chunk. */
-    if (pFormat->container == drwav_container_riff) {
+    /* "RIFF"/"RIFX" chunk. */
+    if (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rifx) {
         drwav_uint32 chunkSizeRIFF = 36 + (drwav_uint32)initialDataChunkSize;   /* +36 = "WAVE" + [sizeof "fmt " chunk] + [data chunk header] */
-        runningPos += drwav__write(pWav, "RIFF", 4);
-        runningPos += drwav__write_u32ne_to_le(pWav, chunkSizeRIFF);
+        runningPos += drwav__write(pWav, (pFormat->container == drwav_container_rifx) ? "RIFX" : "RIFF", 4);
+        runningPos += drwav__write_u32ne_to_ex(pWav, pFormat->container, chunkSizeRIFF);
         runningPos += drwav__write(pWav, "WAVE", 4);
     } else if (pFormat->container == drwav_container_w64) {
         drwav_uint64 chunkSizeRIFF = 80 + 24 + initialDataChunkSize;            /* +24 because W64 includes the size of the GUID and size fields. */
@@ -4746,36 +4823,36 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_write__internal(drwav* pWav, const drwav_d
 
 
     /* "fmt " chunk. */
-    if (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rf64) {
+    if (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rifx || pFormat->container == drwav_container_rf64) {
         chunkSizeFMT = 16;
         runningPos += drwav__write(pWav, "fmt ", 4);
-        runningPos += drwav__write_u32ne_to_le(pWav, (drwav_uint32)chunkSizeFMT);
+        runningPos += drwav__write_u32ne_to_ex(pWav, pFormat->container, (drwav_uint32)chunkSizeFMT);
     } else if (pFormat->container == drwav_container_w64) {
         chunkSizeFMT = 40;
         runningPos += drwav__write(pWav, drwavGUID_W64_FMT, 16);
         runningPos += drwav__write_u64ne_to_le(pWav, chunkSizeFMT);
     }
 
-    runningPos += drwav__write_u16ne_to_le(pWav, pWav->fmt.formatTag);
-    runningPos += drwav__write_u16ne_to_le(pWav, pWav->fmt.channels);
-    runningPos += drwav__write_u32ne_to_le(pWav, pWav->fmt.sampleRate);
-    runningPos += drwav__write_u32ne_to_le(pWav, pWav->fmt.avgBytesPerSec);
-    runningPos += drwav__write_u16ne_to_le(pWav, pWav->fmt.blockAlign);
-    runningPos += drwav__write_u16ne_to_le(pWav, pWav->fmt.bitsPerSample);
+    runningPos += drwav__write_u16ne_to_ex(pWav, pFormat->container, pWav->fmt.formatTag);
+    runningPos += drwav__write_u16ne_to_ex(pWav, pFormat->container, pWav->fmt.channels);
+    runningPos += drwav__write_u32ne_to_ex(pWav, pFormat->container, pWav->fmt.sampleRate);
+    runningPos += drwav__write_u32ne_to_ex(pWav, pFormat->container, pWav->fmt.avgBytesPerSec);
+    runningPos += drwav__write_u16ne_to_ex(pWav, pFormat->container, pWav->fmt.blockAlign);
+    runningPos += drwav__write_u16ne_to_ex(pWav, pFormat->container, pWav->fmt.bitsPerSample);
 
     /* TODO: is a 'fact' chunk required for DR_WAVE_FORMAT_IEEE_FLOAT? */
 
-    if (!pWav->isSequentialWrite && pWav->pMetadata != NULL && pWav->metadataCount > 0 && (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rf64)) {
-        runningPos += drwav__write_or_count_metadata(pWav, pWav->pMetadata, pWav->metadataCount);
+    if (!pWav->isSequentialWrite && pWav->pMetadata != NULL && pWav->metadataCount > 0 && (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rifx || pFormat->container == drwav_container_rf64)) {
+        runningPos += drwav__write_or_count_metadata(pWav, pFormat->container, pWav->pMetadata, pWav->metadataCount);
     }
 
     pWav->dataChunkDataPos = runningPos;
 
     /* "data" chunk. */
-    if (pFormat->container == drwav_container_riff) {
+    if (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rifx) {
         drwav_uint32 chunkSizeDATA = (drwav_uint32)initialDataChunkSize;
         runningPos += drwav__write(pWav, "data", 4);
-        runningPos += drwav__write_u32ne_to_le(pWav, chunkSizeDATA);
+        runningPos += drwav__write_u32ne_to_ex(pWav, pFormat->container, chunkSizeDATA);
     } else if (pFormat->container == drwav_container_w64) {
         drwav_uint64 chunkSizeDATA = 24 + initialDataChunkSize;     /* +24 because W64 includes the size of the GUID and size fields. */
         runningPos += drwav__write(pWav, drwavGUID_W64_DATA, 16);
@@ -4844,8 +4921,8 @@ DRWAV_API drwav_uint64 drwav_target_write_size_bytes(const drwav_data_format* pF
     drwav_uint64 riffChunkSizeBytes;
     drwav_uint64 fileSizeBytes = 0;
 
-    if (pFormat->container == drwav_container_riff) {
-        riffChunkSizeBytes = drwav__riff_chunk_size_riff(targetDataSizeBytes, pMetadata, metadataCount);
+    if (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rifx) {
+        riffChunkSizeBytes = drwav__riff_chunk_size_riff(pFormat->container, targetDataSizeBytes, pMetadata, metadataCount);
         fileSizeBytes = (8 + riffChunkSizeBytes);   /* +8 because WAV doesn't include the size of the ChunkID and ChunkSize fields. */
     } else if (pFormat->container == drwav_container_w64) {
         riffChunkSizeBytes = drwav__riff_chunk_size_w64(targetDataSizeBytes);
@@ -5875,17 +5952,17 @@ DRWAV_PRIVATE void drwav_write_chunk_sizes(drwav* pWav)
     to do this when using non-sequential mode.
     */
     if (pWav->onSeek != NULL && !pWav->isSequentialWrite) {
-        if (pWav->container == drwav_container_riff) {
-            /* The "RIFF" chunk size. */
+        if (pWav->container == drwav_container_riff || pWav->container == drwav_container_rifx) {
+            /* The "RIFF"/"RIFX" chunk size. */
             if (pWav->onSeek(pWav->pUserData, 4, DRWAV_SEEK_SET)) {
-                drwav_uint32 riffChunkSize = drwav__riff_chunk_size_riff(pWav->dataChunkDataSize, pWav->pMetadata, pWav->metadataCount);
-                drwav__write_u32ne_to_le(pWav, riffChunkSize);
+                drwav_uint32 riffChunkSize = drwav__riff_chunk_size_riff(pWav->container, pWav->dataChunkDataSize, pWav->pMetadata, pWav->metadataCount);
+                drwav__write_u32ne_to_ex(pWav, pWav->container, riffChunkSize);
             }
 
             /* The "data" chunk size. */
             if (pWav->onSeek(pWav->pUserData, (int)pWav->dataChunkDataPos - 4, DRWAV_SEEK_SET)) {
                 drwav_uint32 dataChunkSize = drwav__data_chunk_size_riff(pWav->dataChunkDataSize);
-                drwav__write_u32ne_to_le(pWav, dataChunkSize);
+                drwav__write_u32ne_to_ex(pWav, pWav->container, dataChunkSize);
             }
         } else if (pWav->container == drwav_container_w64) {
             /* The "RIFF" chunk size. */
@@ -6403,14 +6480,15 @@ DRWAV_API drwav_uint64 drwav_write_pcm_frames_be(drwav* pWav, drwav_uint64 frame
         DRWAV_ASSERT(bytesToWriteThisIteration <= DRWAV_SIZE_MAX);  /* <-- This is checked above. */
 
         /*
-        WAV files are always little-endian. We need to byte swap on big-endian architectures. Since our input buffer is read-only we need
-        to use an intermediary buffer for the conversion.
+        The data needs to be byte swapped to match the byte order of the container. Since our input buffer is read-only
+        we need to use an intermediary buffer for the conversion.
         */
-        sampleCount = sizeof(temp)/bytesPerSample;
-
-        if (bytesToWriteThisIteration > ((drwav_uint64)sampleCount)*bytesPerSample) {
-            bytesToWriteThisIteration = ((drwav_uint64)sampleCount)*bytesPerSample;
+        if (bytesToWriteThisIteration > sizeof(temp)) {
+            bytesToWriteThisIteration = sizeof(temp);
         }
+
+        /* Only byte swap the samples being written in this iteration - not the whole intermediary buffer. */
+        sampleCount = (drwav_uint32)(bytesToWriteThisIteration / bytesPerSample);
 
         DRWAV_COPY_MEMORY(temp, pRunningData, (size_t)bytesToWriteThisIteration);
         drwav__bswap_samples(temp, sampleCount, bytesPerSample);
@@ -6430,7 +6508,15 @@ DRWAV_API drwav_uint64 drwav_write_pcm_frames_be(drwav* pWav, drwav_uint64 frame
 
 DRWAV_API drwav_uint64 drwav_write_pcm_frames(drwav* pWav, drwav_uint64 framesToWrite, const void* pData)
 {
-    if (drwav__is_little_endian()) {
+    /*
+    The _le/_be suffix on drwav_write_pcm_frames_le/be() refers to the byte order of the input data relative to the host.
+    The data is always written in the byte order of the container, so we choose whether or not a byte swap is required based
+    on the combination of the host's byte order and the container's byte order.
+    */
+    drwav_bool32 containerIsBE = drwav_is_container_be(pWav->container);
+    drwav_bool32 hostIsLE = drwav__is_little_endian();
+
+    if (hostIsLE == !containerIsBE) {
         return drwav_write_pcm_frames_le(pWav, framesToWrite, pData);
     } else {
         return drwav_write_pcm_frames_be(pWav, framesToWrite, pData);
