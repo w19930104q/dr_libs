@@ -7507,6 +7507,7 @@ static drflac_bool32 drflac__init_private__native(drflac_init_info* pInit, drfla
 #ifndef DR_FLAC_NO_OGG
 #define DRFLAC_OGG_MAX_PAGE_SIZE            65307
 #define DRFLAC_OGG_CAPTURE_PATTERN_CRC32    1605413199  /* CRC-32 of "OggS". */
+#define DRFLAC_OGG_FLAC_MAPPING_HEADER_SIZE 9          /* The size in bytes of the Ogg/FLAC mapping header at the start of the bos page body (0x7F + "FLAC" + 2 mapping-version bytes + 2 non-audio-packet-count bytes + "fLaC"). These bytes belong to the encapsulation, not the native FLAC byte stream. */
 
 typedef enum
 {
@@ -7754,12 +7755,18 @@ typedef struct
     void* pUserData;                        /* The user data passed on onRead and onSeek. This is the user data that was passed on drflac_open() and family. */
     drflac_uint64 currentBytePos;           /* The position of the byte we are sitting on in the physical byte stream. Used for efficient seeking. */
     drflac_uint64 firstBytePos;             /* The position of the first byte in the physical bitstream. Points to the start of the "OggS" identifier of the FLAC bos page. */
+    drflac_uint64 currentLogicalBytePos;    /* The position of the next byte to be delivered to the native FLAC layer, measured in the logical (de-multiplexed, de-paged) FLAC byte stream. Backing value for the onTell callback. */
+    drflac_uint64 logicalStreamSize;        /* The total size of the logical FLAC byte stream in bytes. Only valid when logicalStreamSizeKnown is true. */
+    drflac_bool32 logicalStreamSizeKnown;   /* True once a size measurement has completed successfully and logicalStreamSize holds a valid value. */
+    drflac_bool32 logicalStreamSizeUnavailable; /* Set permanently when a measurement could not produce a trustworthy size, so end-relative seeking reports "not supported" cheaply instead of re-walking the whole physical bitstream on every call. */
     drflac_uint32 serialNumber;             /* The serial number of the FLAC audio pages. This is determined by the initial header page that was read during initialization. */
     drflac_ogg_page_header bosPageHeader;   /* Used for seeking. */
     drflac_ogg_page_header currentPageHeader;
     drflac_uint32 bytesRemainingInPage;
+    drflac_uint32 bytesConsumedInPage;    /* The number of body bytes of the current page already delivered through the logical layer. Kept separate from bytesRemainingInPage because in-page CUR seeks advance the logical position without reading. */
     drflac_uint32 pageDataSize;
     drflac_uint8 pageData[DRFLAC_OGG_MAX_PAGE_SIZE];
+    drflac_bool32 streamSizeProbeInProgress;  /* True only while the native FLAC metadata layer is probing the stream size (its SEEK_END/SEEK_SET pair). In this mode CRC recovery is tolerant so a damaged audio page cannot make opening fail, mirroring the read path and the behaviour observed when the backend has no native end-relative seeking. */
 } drflac_oggbs; /* oggbs = Ogg Bitstream */
 
 static size_t drflac_oggbs__read_physical(drflac_oggbs* oggbs, void* bufferOut, size_t bytesToRead)
@@ -7806,18 +7813,27 @@ static drflac_bool32 drflac_oggbs__seek_physical(drflac_oggbs* oggbs, drflac_uin
     }
 }
 
-static drflac_bool32 drflac_oggbs__goto_next_page(drflac_oggbs* oggbs, drflac_ogg_crc_mismatch_recovery recoveryMethod)
+static drflac_bool32 drflac_oggbs__goto_next_page_ex(drflac_oggbs* oggbs, drflac_ogg_crc_mismatch_recovery recoveryMethod, drflac_bool32* pReachedEndOfStream)
 {
     drflac_ogg_page_header header;
+    if (pReachedEndOfStream != NULL) {
+        *pReachedEndOfStream = DRFLAC_FALSE;
+    }
+
     for (;;) {
         drflac_uint32 crc32 = 0;
         drflac_uint32 bytesRead;
         drflac_uint32 pageBodySize;
+        drflac_result headerResult;
 #ifndef DR_FLAC_NO_CRC
         drflac_uint32 actualCRC32;
 #endif
 
-        if (drflac_ogg__read_page_header(oggbs->onRead, oggbs->pUserData, &header, &bytesRead, &crc32) != DRFLAC_SUCCESS) {
+        headerResult = drflac_ogg__read_page_header(oggbs->onRead, oggbs->pUserData, &header, &bytesRead, &crc32);
+        if (headerResult != DRFLAC_SUCCESS) {
+            if (pReachedEndOfStream != NULL && headerResult == DRFLAC_AT_END) {
+                *pReachedEndOfStream = DRFLAC_TRUE;  /* Clean end of the physical bitstream - not an error condition for a page walk. */
+            }
             return DRFLAC_FALSE;
         }
         oggbs->currentBytePos += bytesRead;
@@ -7853,7 +7869,7 @@ static drflac_bool32 drflac_oggbs__goto_next_page(drflac_oggbs* oggbs, drflac_og
                 go to the next valid page to ensure we're in a good state, but return false to let the caller know that the
                 seek did not fully complete.
                 */
-                drflac_oggbs__goto_next_page(oggbs, drflac_ogg_recover_on_crc_mismatch);
+                drflac_oggbs__goto_next_page_ex(oggbs, drflac_ogg_recover_on_crc_mismatch, NULL);
                 return DRFLAC_FALSE;
             }
         }
@@ -7863,8 +7879,30 @@ static drflac_bool32 drflac_oggbs__goto_next_page(drflac_oggbs* oggbs, drflac_og
 
         oggbs->currentPageHeader = header;
         oggbs->bytesRemainingInPage = pageBodySize;
+        oggbs->bytesConsumedInPage = 0;
         return DRFLAC_TRUE;
     }
+}
+
+/* Convenience wrapper for callers that do not need to distinguish end-of-stream from a real failure. */
+static drflac_bool32 drflac_oggbs__goto_next_page(drflac_oggbs* oggbs, drflac_ogg_crc_mismatch_recovery recoveryMethod)
+{
+    return drflac_oggbs__goto_next_page_ex(oggbs, recoveryMethod, NULL);
+}
+
+/*
+Loads the FLAC page whose "OggS" identifier sits at the given physical byte position. This is the position-absolute
+counterpart of drflac_oggbs__goto_next_page(): the physical stream is repositioned first so the result does not depend
+on whatever page the caller happened to be sitting on. Foreign serials and CRC-corrupted pages at the target are still
+handled by the same recovery rules as drflac_oggbs__goto_next_page().
+*/
+static drflac_bool32 drflac_oggbs__goto_page_at_physical_position(drflac_oggbs* oggbs, drflac_uint64 physicalBytePos, drflac_ogg_crc_mismatch_recovery recoveryMethod)
+{
+    if (!drflac_oggbs__seek_physical(oggbs, physicalBytePos, DRFLAC_SEEK_SET)) {
+        return DRFLAC_FALSE;
+    }
+
+    return drflac_oggbs__goto_next_page(oggbs, recoveryMethod);
 }
 
 /* Function below is unused at the moment, but I might be re-adding it later. */
@@ -7961,17 +7999,21 @@ static size_t drflac__on_read_ogg(void* pUserData, void* bufferOut, size_t bytes
         size_t bytesRemainingToRead = bytesToRead - bytesRead;
 
         if (oggbs->bytesRemainingInPage >= bytesRemainingToRead) {
-            DRFLAC_COPY_MEMORY(pRunningBufferOut, oggbs->pageData + (oggbs->pageDataSize - oggbs->bytesRemainingInPage), bytesRemainingToRead);
+            DRFLAC_COPY_MEMORY(pRunningBufferOut, oggbs->pageData + oggbs->bytesConsumedInPage, bytesRemainingToRead);
             bytesRead += bytesRemainingToRead;
             oggbs->bytesRemainingInPage -= (drflac_uint32)bytesRemainingToRead;
+            oggbs->bytesConsumedInPage += (drflac_uint32)bytesRemainingToRead;
+            oggbs->currentLogicalBytePos += (drflac_uint64)bytesRemainingToRead;
             break;
         }
 
         /* If we get here it means some of the requested data is contained in the next pages. */
         if (oggbs->bytesRemainingInPage > 0) {
-            DRFLAC_COPY_MEMORY(pRunningBufferOut, oggbs->pageData + (oggbs->pageDataSize - oggbs->bytesRemainingInPage), oggbs->bytesRemainingInPage);
+            DRFLAC_COPY_MEMORY(pRunningBufferOut, oggbs->pageData + oggbs->bytesConsumedInPage, oggbs->bytesRemainingInPage);
             bytesRead += oggbs->bytesRemainingInPage;
             pRunningBufferOut += oggbs->bytesRemainingInPage;
+            oggbs->bytesConsumedInPage += oggbs->bytesRemainingInPage;
+            oggbs->currentLogicalBytePos += oggbs->bytesRemainingInPage;
             oggbs->bytesRemainingInPage = 0;
         }
 
@@ -7984,22 +8026,216 @@ static size_t drflac__on_read_ogg(void* pUserData, void* bufferOut, size_t bytes
     return bytesRead;
 }
 
+/*
+Positions the physical stream at the start of a FLAC page whose "OggS" identifier sits at pageStartPhysicalBytePos,
+then consumes bytesConsumedInPage body bytes so the resulting state matches the caller's saved in-page position.
+The page is re-read rather than restored from a copy, which keeps the cached page data consistent with the physical
+read pointer. Used to restore the stream after operations that had to walk away from the current position.
+*/
+static drflac_bool32 drflac_oggbs__seek_to_page_and_consume(drflac_oggbs* oggbs, drflac_uint64 pageStartPhysicalBytePos, drflac_uint32 bytesConsumedInPage)
+{
+    /*
+    Use the tolerant recovery mode: a page that was readable when the caller's state was saved cannot have become
+    corrupted since, so this will only ever skip genuinely unrelated data encountered while repositioning.
+    */
+    if (!drflac_oggbs__goto_page_at_physical_position(oggbs, pageStartPhysicalBytePos, drflac_ogg_recover_on_crc_mismatch)) {
+        return DRFLAC_FALSE;
+    }
+
+    if (bytesConsumedInPage > 0) {
+        if (bytesConsumedInPage > oggbs->bytesRemainingInPage) {
+            return DRFLAC_FALSE;   /* Saved state does not belong to this page. */
+        }
+
+        /*
+        The page body is already in pageData and the physical pointer sits one byte past it, so re-consuming the
+        saved in-page offset is purely a matter of logical bookkeeping - no physical seek.
+        */
+        oggbs->bytesRemainingInPage -= bytesConsumedInPage;
+        oggbs->bytesConsumedInPage   = bytesConsumedInPage;
+    } else {
+        oggbs->bytesConsumedInPage = 0;
+    }
+
+    return DRFLAC_TRUE;
+}
+
+/*
+Measures the size of the logical FLAC byte stream. This is the size of the native FLAC byte stream delivered through
+the logical layer, i.e. the sum of the body sizes of every physical page belonging to the FLAC serial number that
+passes the CRC check, minus the 9-byte Ogg/FLAC mapping header in the bos page which is consumed during initialization
+and never delivered through the logical layer. Foreign serials (multiplexed streams) and CRC-corrupted pages are
+excluded, matching exactly what the decoder can deliver. The result is cached.
+
+The measurement is a best-effort convenience for end-relative seeking: if the physical bitstream cannot be walked
+completely (a truncated read, a page that cannot be parsed at all, a backend seek failure, ...) the size is marked
+permanently unavailable and the function returns false rather than reporting a truncated size. A truncated size would
+be dangerous because callers use it for bounds checks against fully readable metadata. The caller's stream position is
+saved up front and restored before returning regardless of the outcome.
+*/
+static drflac_bool32 drflac_oggbs__get_logical_stream_size(drflac_oggbs* oggbs, drflac_uint64* pSize)
+{
+    drflac_uint64 savedLogicalBytePos;
+    drflac_uint64 savedPageStartPhysicalBytePos = 0;
+    drflac_uint32 savedBytesConsumedInPage = 0;
+    drflac_bool32 savedHasPage;
+    drflac_uint64 logicalSize = 0;
+    drflac_bool32 scanSucceeded = DRFLAC_TRUE;
+    drflac_bool32 restoreSucceeded = DRFLAC_TRUE;
+    drflac_uint64 savedPhysicalBytePos;
+
+    if (oggbs->logicalStreamSizeKnown) {
+        *pSize = oggbs->logicalStreamSize;
+        return DRFLAC_TRUE;
+    }
+
+    if (oggbs->logicalStreamSizeUnavailable) {
+        return DRFLAC_FALSE;  /* A previous measurement already established that the size cannot be determined. */
+    }
+
+    /*
+    Save the caller's position. When a page is loaded it is expressed as a page start plus an in-page offset;
+    otherwise the raw physical cursor is enough. The latter happens right after opening, where initialization has
+    consumed the whole bos body and left the cursor on the next page's "OggS" identifier - that exact cursor must be
+    put back, not the bos page start, or the next read would re-deliver the mapping header.
+    */
+    savedLogicalBytePos      = oggbs->currentLogicalBytePos;
+    savedPhysicalBytePos     = oggbs->currentBytePos;
+    savedHasPage             = (oggbs->pageDataSize > 0);
+    if (savedHasPage) {
+        savedBytesConsumedInPage      = oggbs->bytesConsumedInPage;
+        savedPageStartPhysicalBytePos = oggbs->currentBytePos - drflac_ogg__get_page_header_size(&oggbs->currentPageHeader) - oggbs->pageDataSize;
+    } else {
+        /*
+        No logical page has been cached yet (this is the state during opening, right after initialization consumed the
+        whole bos page through the raw callbacks). The oggbs bookkeeping did not follow those reads, so currentBytePos
+        does not reflect the real backend cursor. Ask the backend where it actually is; when no tell callback exists,
+        fall back to the byte right after the bos page, which is where initialization always leaves the cursor.
+        */
+        drflac_int64 physicalCursor;
+        if (oggbs->onTell != NULL && oggbs->onTell(oggbs->pUserData, &physicalCursor)) {
+            savedPhysicalBytePos = (drflac_uint64)physicalCursor;
+        } else {
+            savedPhysicalBytePos = oggbs->firstBytePos
+                + drflac_ogg__get_page_header_size(&oggbs->bosPageHeader)
+                + drflac_ogg__get_page_body_size(&oggbs->bosPageHeader);
+        }
+    }
+
+    if (!drflac_oggbs__seek_physical(oggbs, oggbs->firstBytePos, DRFLAC_SEEK_SET)) {
+        /* The backend cannot reposition at all. Remember the failure and go through the normal restore path. */
+        scanSucceeded = DRFLAC_FALSE;
+    } else {
+        oggbs->bytesRemainingInPage  = 0;
+        oggbs->currentLogicalBytePos = 0;
+        logicalSize = 0;
+        for (;;) {
+            drflac_bool32 reachedEndOfStream = DRFLAC_FALSE;
+            if (!drflac_oggbs__goto_next_page_ex(oggbs, drflac_ogg_recover_on_crc_mismatch, &reachedEndOfStream)) {
+                /*
+                With tolerant recovery the only pages skipped mid-stream are CRC-bad ones (which simply do not
+                contribute their bytes) and foreign-serial pages, neither of which stops the walk. Reaching the end
+                of the physical bitstream is therefore the normal completion - including the case where the EOS page
+                itself was CRC-bad and got skipped. Any other failure means the size cannot be trusted.
+                */
+                if (!reachedEndOfStream) {
+                    scanSucceeded = DRFLAC_FALSE;
+                }
+                break;
+            }
+
+            logicalSize += oggbs->pageDataSize;
+
+            if (oggbs->currentPageHeader.headerType & 0x04) {
+                break;  /* End-of-stream page of the FLAC track: the complete logical stream has now been measured. */
+            }
+        }
+    }
+
+    /*
+    Restore the caller's position. If a page was loaded it is re-read from the physical stream and its in-page offset
+    re-consumed. Otherwise the raw physical cursor saved on entry is put back, leaving an empty page cache so the next
+    read scans from that cursor exactly as it would have before the measurement.
+    */
+    oggbs->currentLogicalBytePos = savedLogicalBytePos;
+    if (savedHasPage) {
+        if (!drflac_oggbs__seek_to_page_and_consume(oggbs, savedPageStartPhysicalBytePos, savedBytesConsumedInPage)) {
+            restoreSucceeded = DRFLAC_FALSE;
+        }
+    } else {
+        /*
+        Put the physical cursor back exactly where it was on entry (typically the next page's "OggS" after the fully
+        consumed bos page). bytesRemainingInPage stays zero because no page body has been cached through the logical
+        layer; the next read scans from this cursor just as it would have before the measurement.
+        */
+        if (!drflac_oggbs__seek_physical(oggbs, savedPhysicalBytePos, DRFLAC_SEEK_SET)) {
+            restoreSucceeded = DRFLAC_FALSE;
+        }
+        oggbs->bytesRemainingInPage = 0;
+        oggbs->pageDataSize = 0;
+    }
+
+    /*
+    A successful walk always includes the bos page and therefore at least its 51 body bytes, which is larger than the
+    9-byte mapping header that is about to be subtracted. A smaller value can only result from a failed scan.
+    */
+    if (scanSucceeded && restoreSucceeded && logicalSize >= DRFLAC_OGG_FLAC_MAPPING_HEADER_SIZE) {
+        /* Drop the Ogg/FLAC mapping header which is consumed at open time and is not part of the native FLAC byte stream. */
+        logicalSize -= DRFLAC_OGG_FLAC_MAPPING_HEADER_SIZE;
+        oggbs->logicalStreamSize = logicalSize;
+        *pSize = logicalSize;
+        oggbs->logicalStreamSizeKnown = DRFLAC_TRUE;
+        return DRFLAC_TRUE;
+    }
+
+    /* The scan or the position restore failed. Remember this permanently; a truncated or missing size must never be reported. */
+    oggbs->logicalStreamSizeUnavailable = DRFLAC_TRUE;
+    return DRFLAC_FALSE;
+}
+
 static drflac_bool32 drflac__on_seek_ogg(void* pUserData, int offset, drflac_seek_origin origin)
 {
     drflac_oggbs* oggbs = (drflac_oggbs*)pUserData;
     int bytesSeeked = 0;
+    /*
+    The metadata layer's stream-size probe is the only seek operation that must tolerate CRC-corrupted pages: it is
+    not positioning the decoder, and failing it would reject an otherwise decodable file at open time. Every other
+    seek keeps the strict behaviour of failing on a CRC mismatch so callers of drflac_seek_to_pcm_frame() get a
+    reliable success/failure answer.
+    */
+    drflac_ogg_crc_mismatch_recovery recoveryMethod = oggbs->streamSizeProbeInProgress ?
+        drflac_ogg_recover_on_crc_mismatch : drflac_ogg_fail_on_crc_mismatch;
 
     DRFLAC_ASSERT(oggbs != NULL);
     DRFLAC_ASSERT(offset >= 0);  /* <-- Never seek backwards. */
 
     /* Seeking is always forward which makes things a lot simpler. */
     if (origin == DRFLAC_SEEK_SET) {
-        if (!drflac_oggbs__seek_physical(oggbs, (int)oggbs->firstBytePos, DRFLAC_SEEK_SET)) {
+        /*
+        Always load the bos page from its known physical position rather than reading the next page from wherever the
+        physical stream happens to be. This makes SET independent of the caller's current position (in particular it
+        stays correct after a logical stream size measurement that walked the whole file).
+        */
+        if (!drflac_oggbs__goto_page_at_physical_position(oggbs, oggbs->firstBytePos, recoveryMethod)) {
             return DRFLAC_FALSE;
         }
 
-        if (!drflac_oggbs__goto_next_page(oggbs, drflac_ogg_fail_on_crc_mismatch)) {
-            return DRFLAC_FALSE;
+        /*
+        The native FLAC layer addresses bytes as if the Ogg encapsulation did not exist, so logical position zero is
+        the first byte after the bos page's Ogg/FLAC mapping header (the "fLaC" identifier), not the first body byte.
+        Consume that mapping header through the logical counters only - the whole body is already cached in pageData
+        and the physical pointer must remain one byte past the page body.
+        */
+        if (oggbs->pageDataSize < DRFLAC_OGG_FLAC_MAPPING_HEADER_SIZE ||
+            oggbs->bytesRemainingInPage < DRFLAC_OGG_FLAC_MAPPING_HEADER_SIZE) {
+            return DRFLAC_FALSE;   /* The bos page is too small to carry the mapping header. */
+        }
+        oggbs->bytesRemainingInPage -= DRFLAC_OGG_FLAC_MAPPING_HEADER_SIZE;
+        oggbs->bytesConsumedInPage   = DRFLAC_OGG_FLAC_MAPPING_HEADER_SIZE;
+        oggbs->currentLogicalBytePos = 0;
+
+        if (offset == 0) {
+            return DRFLAC_TRUE;
         }
 
         return drflac__on_seek_ogg(pUserData, offset, DRFLAC_SEEK_CUR);
@@ -8009,27 +8245,63 @@ static drflac_bool32 drflac__on_seek_ogg(void* pUserData, int offset, drflac_see
             DRFLAC_ASSERT(bytesRemainingToSeek >= 0);
 
             if (oggbs->bytesRemainingInPage >= (size_t)bytesRemainingToSeek) {
+                /*
+                Staying inside the current page. Only the logical bookkeeping moves: the whole page body was already
+                read into pageData by goto_next_page(), so the physical pointer is sitting one byte past the page body
+                and must not be seeked over these bytes again (that would double-count them and overshoot the file).
+                */
                 bytesSeeked += bytesRemainingToSeek;
                 (void)bytesSeeked;  /* <-- Silence a dead store warning emitted by Clang Static Analyzer. */
                 oggbs->bytesRemainingInPage -= bytesRemainingToSeek;
+                oggbs->bytesConsumedInPage  += (drflac_uint32)bytesRemainingToSeek;
                 break;
             }
 
-            /* If we get here it means some of the requested data is contained in the next pages. */
+            /*
+            The seek runs past the current page. Do NOT physically seek over the tail: goto_next_page() reads the
+            whole page body itself and leaves the physical pointer right after it, so a manual seek would double-count
+            those bytes and overshoot. Just advance the logical counters and load the next page.
+            */
             if (oggbs->bytesRemainingInPage > 0) {
-                bytesSeeked += (int)oggbs->bytesRemainingInPage;
+                drflac_uint32 bytesToEndOfPage = oggbs->bytesRemainingInPage;
+                bytesSeeked += (int)bytesToEndOfPage;
+                oggbs->bytesConsumedInPage += bytesToEndOfPage;
                 oggbs->bytesRemainingInPage = 0;
             }
 
             DRFLAC_ASSERT(bytesRemainingToSeek > 0);
-            if (!drflac_oggbs__goto_next_page(oggbs, drflac_ogg_fail_on_crc_mismatch)) {
+            if (!drflac_oggbs__goto_next_page(oggbs, recoveryMethod)) {
                 /* Failed to go to the next page. We either hit the end of the stream or had a CRC mismatch. */
                 return DRFLAC_FALSE;
             }
         }
+
+        /* Every skipped byte is a byte delivered (discarded) from the logical FLAC byte stream. */
+        oggbs->currentLogicalBytePos += (drflac_uint64)offset;
     } else if (origin == DRFLAC_SEEK_END) {
-        /* Seeking to the end is not supported. */
-        return DRFLAC_FALSE;
+        drflac_uint64 logicalStreamSize;
+        drflac_bool32 result;
+
+        /*
+        End-relative seeking is defined against the logical (de-multiplexed, de-paged) FLAC byte stream. Its size has
+        to be measured lazily by walking the physical bitstream because Ogg itself does not record it.
+
+        The native FLAC metadata layer pairs this SEEK_END with a SEEK_SET back to the metadata position purely to
+        measure and validate the stream. Mark that follow-up as a tolerant probe so CRC-damaged audio pages do not
+        turn the open into a failure. The flag is cleared on the next entry once the probe SET is done.
+        */
+        if (!drflac_oggbs__get_logical_stream_size(oggbs, &logicalStreamSize)) {
+            return DRFLAC_FALSE;
+        }
+
+        if ((drflac_uint64)offset > logicalStreamSize) {
+            return DRFLAC_FALSE;
+        }
+
+        oggbs->streamSizeProbeInProgress = DRFLAC_TRUE;
+        result = drflac__on_seek_ogg(pUserData, (int)(logicalStreamSize - (drflac_uint64)offset), DRFLAC_SEEK_SET);
+        oggbs->streamSizeProbeInProgress = DRFLAC_FALSE;
+        return result;
     }
 
     return DRFLAC_TRUE;
@@ -8037,40 +8309,60 @@ static drflac_bool32 drflac__on_seek_ogg(void* pUserData, int offset, drflac_see
 
 static drflac_bool32 drflac__on_tell_ogg(void* pUserData, drflac_int64* pCursor)
 {
+    drflac_oggbs* oggbs = (drflac_oggbs*)pUserData;
+
+    DRFLAC_ASSERT(oggbs != NULL);
+    DRFLAC_ASSERT(pCursor != NULL);
+
     /*
-    Not implemented for Ogg containers because we don't currently track the byte position of the logical bitstream. To support this, we'll need
-    to track the position in drflac__on_read_ogg and drflac__on_seek_ogg.
+    Report the byte position within the logical (de-multiplexed, de-paged) FLAC byte stream. This is the position
+    maintained by drflac__on_read_ogg() and drflac__on_seek_ogg(), and is independent of Ogg page headers and any
+    foreign streams interleaved in a multiplexed physical bitstream.
     */
-    (void)pUserData;
-    (void)pCursor;
-    return DRFLAC_FALSE;
+    *pCursor = (drflac_int64)oggbs->currentLogicalBytePos;
+    return DRFLAC_TRUE;
 }
 
 
 static drflac_bool32 drflac_ogg__seek_to_pcm_frame(drflac* pFlac, drflac_uint64 pcmFrameIndex)
 {
     drflac_oggbs* oggbs = (drflac_oggbs*)pFlac->_oggbs;
-    drflac_uint64 originalBytePos;
+    drflac_uint64 originalLogicalBytePos;
+    drflac_uint64 originalPageStartPhysicalBytePos;
+    drflac_uint32 originalBytesConsumedInPage;
+    drflac_bool32 originalHasPage;
     drflac_uint64 runningGranulePosition;
     drflac_uint64 runningFrameBytePos = 0;
     drflac_uint64 runningPCMFrameCount = 0;
     drflac_bool32 hasFramePage = DRFLAC_FALSE;
+    drflac_bool32 result = DRFLAC_FALSE;
 
     DRFLAC_ASSERT(oggbs != NULL);
 
-    originalBytePos = oggbs->currentBytePos;   /* For recovery. Points to the OggS identifier. */
+    /*
+    Save the full stream state up front as a page start plus an in-page consumption offset, so any failure below can
+    reload the exact page the caller was sitting on and resume decoding. Saving only the physical byte position is not
+    enough because the cached page (including its in-page consumption state) would be left pointing at unrelated data.
+    */
+    originalLogicalBytePos       = oggbs->currentLogicalBytePos;
+    originalHasPage              = (oggbs->pageDataSize > 0);
+    originalBytesConsumedInPage  = 0;
+    originalPageStartPhysicalBytePos = 0;
+    if (originalHasPage) {
+        originalBytesConsumedInPage      = oggbs->bytesConsumedInPage;
+        originalPageStartPhysicalBytePos = oggbs->currentBytePos - drflac_ogg__get_page_header_size(&oggbs->currentPageHeader) - oggbs->pageDataSize;
+    }
 
     /* First seek to the first frame. */
     if (!drflac__seek_to_byte(&pFlac->bs, pFlac->firstFLACFramePosInBytes)) {
-        return DRFLAC_FALSE;
+        goto done;
     }
     oggbs->bytesRemainingInPage = 0;
 
     runningGranulePosition = 0;
     for (;;) {
         if (!drflac_oggbs__goto_next_page(oggbs, drflac_ogg_recover_on_crc_mismatch)) {
-            drflac_oggbs__seek_physical(oggbs, originalBytePos, DRFLAC_SEEK_SET);
-            return DRFLAC_FALSE;   /* Never did find that sample... */
+            goto done;   /* Never did find that sample... */
         }
 
         /*
@@ -8108,10 +8400,10 @@ static drflac_bool32 drflac_ogg__seek_to_pcm_frame(drflac* pFlac, drflac_uint64 
     we find the one containing the target sample.
     */
     if (!drflac_oggbs__seek_physical(oggbs, runningFrameBytePos, DRFLAC_SEEK_SET)) {
-        return DRFLAC_FALSE;
+        goto done;
     }
     if (!drflac_oggbs__goto_next_page(oggbs, drflac_ogg_recover_on_crc_mismatch)) {
-        return DRFLAC_FALSE;
+        goto done;
     }
 
     /*
@@ -8145,7 +8437,7 @@ static drflac_bool32 drflac_ogg__seek_to_pcm_frame(drflac* pFlac, drflac_uint64 
         drflac_uint64 pcmFrameCountInThisFrame;
 
         if (!drflac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
-            return DRFLAC_FALSE;
+            goto done;
         }
 
         drflac__get_pcm_frame_range_of_current_flac_frame(pFlac, &firstPCMFrameInFLACFrame, &lastPCMFrameInFLACFrame);
@@ -8154,13 +8446,14 @@ static drflac_bool32 drflac_ogg__seek_to_pcm_frame(drflac* pFlac, drflac_uint64 
 
         /* The target can be a frame boundary, including EOF when the total frame count is unknown. */
         if ((runningPCMFrameCount + pcmFrameCountInThisFrame) == pcmFrameIndex) {
-            drflac_result result = drflac__decode_flac_frame(pFlac);
-            if (result == DRFLAC_SUCCESS) {
+            drflac_result result2 = drflac__decode_flac_frame(pFlac);
+            if (result2 == DRFLAC_SUCCESS) {
                 pFlac->currentPCMFrame = pcmFrameIndex;
                 pFlac->currentFLACFrame.pcmFramesRemaining = 0;
-                return DRFLAC_TRUE;
+                result = DRFLAC_TRUE;
+                goto done;
             } else {
-                return DRFLAC_FALSE;
+                goto done;
             }
         }
 
@@ -8169,22 +8462,26 @@ static drflac_bool32 drflac_ogg__seek_to_pcm_frame(drflac* pFlac, drflac_uint64 
             The sample should be in this FLAC frame. We need to fully decode it, however if it's an invalid frame (a CRC mismatch), we need to pretend
             it never existed and keep iterating.
             */
-            drflac_result result = drflac__decode_flac_frame(pFlac);
-            if (result == DRFLAC_SUCCESS) {
+            drflac_result result2 = drflac__decode_flac_frame(pFlac);
+            if (result2 == DRFLAC_SUCCESS) {
                 /* The frame is valid. We just need to skip over some samples to ensure it's sample-exact. */
                 drflac_uint64 pcmFramesToDecode = (size_t)(pcmFrameIndex - runningPCMFrameCount);    /* <-- Safe cast because the maximum number of samples in a frame is 65535. */
                 if (pcmFramesToDecode == 0) {
-                    return DRFLAC_TRUE;
+                    result = DRFLAC_TRUE;
+                    goto done;
                 }
 
                 pFlac->currentPCMFrame = runningPCMFrameCount;
 
-                return drflac__seek_forward_by_pcm_frames(pFlac, pcmFramesToDecode) == pcmFramesToDecode;  /* <-- If this fails, something bad has happened (it should never fail). */
+                if (drflac__seek_forward_by_pcm_frames(pFlac, pcmFramesToDecode) == pcmFramesToDecode) {
+                    result = DRFLAC_TRUE;  /* <-- If this fails, something bad has happened (it should never fail). */
+                }
+                goto done;
             } else {
-                if (result == DRFLAC_CRC_MISMATCH) {
+                if (result2 == DRFLAC_CRC_MISMATCH) {
                     continue;   /* CRC mismatch. Pretend this frame never existed. */
                 } else {
-                    return DRFLAC_FALSE;
+                    goto done;
                 }
             }
         } else {
@@ -8192,18 +8489,42 @@ static drflac_bool32 drflac_ogg__seek_to_pcm_frame(drflac* pFlac, drflac_uint64 
             It's not in this frame. We need to seek past the frame, but check if there was a CRC mismatch. If so, we pretend this
             frame never existed and leave the running sample count untouched.
             */
-            drflac_result result = drflac__seek_to_next_flac_frame(pFlac);
-            if (result == DRFLAC_SUCCESS) {
+            drflac_result result2 = drflac__seek_to_next_flac_frame(pFlac);
+            if (result2 == DRFLAC_SUCCESS) {
                 runningPCMFrameCount += pcmFrameCountInThisFrame;
             } else {
-                if (result == DRFLAC_CRC_MISMATCH) {
+                if (result2 == DRFLAC_CRC_MISMATCH) {
                     continue;   /* CRC mismatch. Pretend this frame never existed. */
                 } else {
-                    return DRFLAC_FALSE;
+                    goto done;
                 }
             }
         }
     }
+
+done:
+    if (!result) {
+        /*
+        The seek failed. Restore the exact position the caller had on entry so the subsequent recovery can resume
+        decoding from where it left off. The saved page is re-read from the physical stream (rather than copied back
+        from memory) so the cached page data stays consistent with the physical read pointer. If no page had been
+        loaded yet (right after opening), just reposition to the first frame like a fresh decoder.
+        */
+        oggbs->currentLogicalBytePos = originalLogicalBytePos;
+
+        if (originalHasPage) {
+            if (!drflac_oggbs__seek_to_page_and_consume(oggbs, originalPageStartPhysicalBytePos, originalBytesConsumedInPage)) {
+                return DRFLAC_FALSE;
+            }
+        } else {
+            if (!drflac__seek_to_byte(&pFlac->bs, pFlac->firstFLACFramePosInBytes)) {
+                return DRFLAC_FALSE;
+            }
+            oggbs->bytesRemainingInPage = 0;
+        }
+    }
+
+    return result;
 }
 
 
@@ -8618,6 +8939,17 @@ static drflac* drflac_open_with_metadata_private(drflac_read_proc onRead, drflac
 
         allocationSize += seekpointCount * sizeof(drflac_seekpoint);
     }
+
+#ifndef DR_FLAC_NO_OGG
+    if (init.container == drflac_container_ogg && pOggbs != NULL) {
+        /*
+        The logical position delivered through onTell is in native FLAC coordinates, so once the metadata has been
+        consumed it must equal the position of the first audio frame (the position the decoder will start reading
+        from), not zero.
+        */
+        pOggbs->currentLogicalBytePos = firstFramePos;
+    }
+#endif
 
     pFlac = (drflac*)drflac__malloc_from_callbacks((size_t)allocationSize, &allocationCallbacks);
     if (pFlac == NULL) {
