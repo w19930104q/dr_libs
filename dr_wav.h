@@ -907,6 +907,9 @@ typedef struct
     /* The position in the stream of the first data byte of the data chunk. This is used for seeking. */
     drwav_uint64 dataChunkDataPos;
 
+    /* The position in the stream of the sample count value within the "fact" chunk. 0 when there is no "fact" chunk. Used for patching in non-sequential write mode. */
+    drwav_uint64 factChunkSampleCountPos;
+
     /* The number of bytes remaining in the data chunk. */
     drwav_uint64 bytesRemaining;
 
@@ -1938,6 +1941,15 @@ static DRWAV_INLINE drwav_bool32 drwav__is_compressed_format_tag(drwav_uint16 fo
     return
         formatTag == DR_WAVE_FORMAT_ADPCM ||
         formatTag == DR_WAVE_FORMAT_DVI_ADPCM;
+}
+
+/*
+Returns whether or not a "fact" chunk needs to be written for the given format tag. A "fact" chunk is required by the
+RIFF/WAVE specification for every non-PCM format (such as IEEE float). It is placed immediately after the "fmt " chunk.
+*/
+static DRWAV_INLINE drwav_bool32 drwav__does_format_require_fact_chunk(drwav_uint16 formatTag)
+{
+    return formatTag != DR_WAVE_FORMAT_PCM;
 }
 
 DRWAV_PRIVATE unsigned int drwav__chunk_padding_size_riff(drwav_uint64 chunkSize)
@@ -4592,9 +4604,25 @@ DRWAV_PRIVATE size_t drwav__write_or_count_metadata(drwav* pWav, drwav_metadata*
     return bytesWritten;
 }
 
-DRWAV_PRIVATE drwav_uint32 drwav__riff_chunk_size_riff(drwav_uint64 dataChunkSize, drwav_metadata* pMetadata, drwav_uint32 metadataCount)
+/*
+The size of a "fact" chunk, not including its padding. For RIFF/RF64 this is the 4 byte ID + 4 byte size + 4 byte
+sample count = 12 bytes. For Wave64 this is the 16 byte GUID + 8 byte size + 8 byte sample count = 32 bytes.
+*/
+DRWAV_PRIVATE drwav_uint64 drwav__fact_chunk_size(drwav_container container)
+{
+    if (container == drwav_container_w64) {
+        return 32;
+    } else {
+        return 12;  /* RIFF and RF64. */
+    }
+}
+
+DRWAV_PRIVATE drwav_uint32 drwav__riff_chunk_size_riff(drwav_uint64 dataChunkSize, drwav_metadata* pMetadata, drwav_uint32 metadataCount, drwav_uint16 formatTag)
 {
     drwav_uint64 chunkSize = 4 + 24 + (drwav_uint64)drwav__write_or_count_metadata(NULL, pMetadata, metadataCount) + 8 + dataChunkSize + drwav__chunk_padding_size_riff(dataChunkSize); /* 4 = "WAVE". 24 = "fmt " chunk. 8 = "data" + u32 data size. */
+    if (drwav__does_format_require_fact_chunk(formatTag)) {
+        chunkSize += drwav__fact_chunk_size(drwav_container_riff);   /* The "fact" chunk is never padded (its size is always an even number of bytes). */
+    }
     if (chunkSize > 0xFFFFFFFFUL) {
         chunkSize = 0xFFFFFFFFUL;
     }
@@ -4611,11 +4639,16 @@ DRWAV_PRIVATE drwav_uint32 drwav__data_chunk_size_riff(drwav_uint64 dataChunkSiz
     }
 }
 
-DRWAV_PRIVATE drwav_uint64 drwav__riff_chunk_size_w64(drwav_uint64 dataChunkSize)
+DRWAV_PRIVATE drwav_uint64 drwav__riff_chunk_size_w64(drwav_uint64 dataChunkSize, drwav_uint16 formatTag)
 {
     drwav_uint64 dataSubchunkPaddingSize = drwav__chunk_padding_size_w64(dataChunkSize);
 
-    return 80 + 24 + dataChunkSize + dataSubchunkPaddingSize;   /* +24 because W64 includes the size of the GUID and size fields. */
+    drwav_uint64 chunkSize = 80 + 24 + dataChunkSize + dataSubchunkPaddingSize;   /* +24 because W64 includes the size of the GUID and size fields. */
+    if (drwav__does_format_require_fact_chunk(formatTag)) {
+        chunkSize += drwav__fact_chunk_size(drwav_container_w64);    /* The "fact" chunk is never padded (its size is always a multiple of 8 bytes). */
+    }
+
+    return chunkSize;
 }
 
 DRWAV_PRIVATE drwav_uint64 drwav__data_chunk_size_w64(drwav_uint64 dataChunkSize)
@@ -4623,9 +4656,12 @@ DRWAV_PRIVATE drwav_uint64 drwav__data_chunk_size_w64(drwav_uint64 dataChunkSize
     return 24 + dataChunkSize;        /* +24 because W64 includes the size of the GUID and size fields. */
 }
 
-DRWAV_PRIVATE drwav_uint64 drwav__riff_chunk_size_rf64(drwav_uint64 dataChunkSize, drwav_metadata *metadata, drwav_uint32 numMetadata)
+DRWAV_PRIVATE drwav_uint64 drwav__riff_chunk_size_rf64(drwav_uint64 dataChunkSize, drwav_metadata *metadata, drwav_uint32 numMetadata, drwav_uint16 formatTag)
 {
     drwav_uint64 chunkSize = 4 + 36 + 24 + (drwav_uint64)drwav__write_or_count_metadata(NULL, metadata, numMetadata) + 8 + dataChunkSize + drwav__chunk_padding_size_riff(dataChunkSize); /* 4 = "WAVE". 36 = "ds64" chunk. 24 = "fmt " chunk. 8 = "data" + u32 data size. */
+    if (drwav__does_format_require_fact_chunk(formatTag)) {
+        chunkSize += drwav__fact_chunk_size(drwav_container_rf64);   /* The "fact" chunk is never padded (its size is always an even number of bytes). */
+    }
     if (chunkSize > 0xFFFFFFFFUL) {
         chunkSize = 0xFFFFFFFFUL;
     }
@@ -4650,7 +4686,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_preinit_write(drwav* pWav, const drwav_data_for
         return DRWAV_FALSE; /* <-- onSeek is required when in non-sequential mode. */
     }
 
-    /* Not currently supporting compressed formats. Will need to add support for the "fact" chunk before we enable this. */
+    /* Compressed formats and WAVE_FORMAT_EXTENSIBLE are not currently supported for writing. Note that a "fact" chunk is written for other non-PCM formats such as IEEE float. */
     if (pFormat->format == DR_WAVE_FORMAT_EXTENSIBLE) {
         return DRWAV_FALSE;
     }
@@ -4688,6 +4724,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_write__internal(drwav* pWav, const drwav_d
     size_t runningPos = 0;
     drwav_uint64 initialDataChunkSize = 0;
     drwav_uint64 chunkSizeFMT;
+    drwav_bool32 hasFactChunk = drwav__does_format_require_fact_chunk((drwav_uint16)pFormat->format);
 
     /*
     The initial values for the "RIFF" and "data" chunks depends on whether or not we are initializing in sequential mode or not. In
@@ -4702,7 +4739,8 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_write__internal(drwav* pWav, const drwav_d
         so for the sake of simplicity I'm not doing any validation for that.
         */
         if (pFormat->container == drwav_container_riff) {
-            if (initialDataChunkSize > (0xFFFFFFFFUL - 36)) {
+            drwav_uint64 maxDataChunkSize = 0xFFFFFFFFUL - (36 + (hasFactChunk ? drwav__fact_chunk_size(drwav_container_riff) : 0));
+            if (initialDataChunkSize > maxDataChunkSize) {
                 return DRWAV_FALSE; /* Not enough room to store every sample. */
             }
         }
@@ -4713,12 +4751,24 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_write__internal(drwav* pWav, const drwav_d
 
     /* "RIFF" chunk. */
     if (pFormat->container == drwav_container_riff) {
-        drwav_uint32 chunkSizeRIFF = 36 + (drwav_uint32)initialDataChunkSize;   /* +36 = "WAVE" + [sizeof "fmt " chunk] + [data chunk header] */
+        drwav_uint32 chunkSizeRIFF;
+        if (hasFactChunk) {
+            /* Non-PCM: compute the full size including the "fact" chunk and any padding. */
+            chunkSizeRIFF = drwav__riff_chunk_size_riff(initialDataChunkSize, NULL, 0, (drwav_uint16)pFormat->format);
+        } else {
+            /* PCM keeps its historical value so its output remains byte-for-byte identical. */
+            chunkSizeRIFF = 36 + (drwav_uint32)initialDataChunkSize;   /* +36 = "WAVE" + [sizeof "fmt " chunk] + [data chunk header] */
+        }
         runningPos += drwav__write(pWav, "RIFF", 4);
         runningPos += drwav__write_u32ne_to_le(pWav, chunkSizeRIFF);
         runningPos += drwav__write(pWav, "WAVE", 4);
     } else if (pFormat->container == drwav_container_w64) {
-        drwav_uint64 chunkSizeRIFF = 80 + 24 + initialDataChunkSize;            /* +24 because W64 includes the size of the GUID and size fields. */
+        drwav_uint64 chunkSizeRIFF;
+        if (hasFactChunk) {
+            chunkSizeRIFF = drwav__riff_chunk_size_w64(initialDataChunkSize, (drwav_uint16)pFormat->format);
+        } else {
+            chunkSizeRIFF = 80 + 24 + initialDataChunkSize;            /* +24 because W64 includes the size of the GUID and size fields. */
+        }
         runningPos += drwav__write(pWav, drwavGUID_W64_RIFF, 16);
         runningPos += drwav__write_u64ne_to_le(pWav, chunkSizeRIFF);
         runningPos += drwav__write(pWav, drwavGUID_W64_WAVE, 16);
@@ -4734,7 +4784,14 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_write__internal(drwav* pWav, const drwav_d
     /* "ds64" chunk (RF64 only). */
     if (pFormat->container == drwav_container_rf64) {
         drwav_uint32 initialds64ChunkSize = 28;                                 /* 28 = [Size of RIFF (8 bytes)] + [Size of DATA (8 bytes)] + [Sample Count (8 bytes)] + [Table Length (4 bytes)]. Table length always set to 0. */
-        drwav_uint64 initialRiffChunkSize = 8 + initialds64ChunkSize + initialDataChunkSize;    /* +8 for the ds64 header. */
+        drwav_uint64 initialRiffChunkSize;
+        if (hasFactChunk) {
+            /* Non-PCM: the spec-correct size, accounting for every header and the "fact" chunk. */
+            initialRiffChunkSize = drwav__riff_chunk_size_rf64(initialDataChunkSize, NULL, 0, (drwav_uint16)pFormat->format);
+        } else {
+            /* PCM keeps its historical value so its output remains byte-for-byte identical. */
+            initialRiffChunkSize = 8 + initialds64ChunkSize + initialDataChunkSize;    /* +8 for the ds64 header. */
+        }
 
         runningPos += drwav__write(pWav, "ds64", 4);
         runningPos += drwav__write_u32ne_to_le(pWav, initialds64ChunkSize);     /* Size of ds64. */
@@ -4763,13 +4820,36 @@ DRWAV_PRIVATE drwav_bool32 drwav_init_write__internal(drwav* pWav, const drwav_d
     runningPos += drwav__write_u16ne_to_le(pWav, pWav->fmt.blockAlign);
     runningPos += drwav__write_u16ne_to_le(pWav, pWav->fmt.bitsPerSample);
 
-    /* TODO: is a 'fact' chunk required for DR_WAVE_FORMAT_IEEE_FLOAT? */
+
+    /*
+    "fact" chunk. Required by the RIFF/WAVE specification for non-PCM formats (such as IEEE float). It holds the number of
+    PCM frames (samples per channel). In non-sequential mode it is initialized to zero and patched in drwav_write_chunk_sizes()
+    as audio data is written.
+    */
+    if (hasFactChunk) {
+        /* channels is guaranteed non-zero for valid formats; guard anyway to avoid a divide-by-zero. */
+        drwav_uint64 factSampleCount = 0;
+        if (pWav->isSequentialWrite && pWav->fmt.channels != 0) {
+            factSampleCount = totalSampleCount / (drwav_uint64)pWav->fmt.channels;
+        }
+
+        if (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rf64) {
+            runningPos += drwav__write(pWav, "fact", 4);
+            runningPos += drwav__write_u32ne_to_le(pWav, 4);                     /* Size of the fact body. Always 4 for RIFF/RF64. */
+            pWav->factChunkSampleCountPos = runningPos;
+            runningPos += drwav__write_u32ne_to_le(pWav, (drwav_uint32)factSampleCount);
+        } else if (pFormat->container == drwav_container_w64) {
+            runningPos += drwav__write(pWav, drwavGUID_W64_FACT, 16);
+            runningPos += drwav__write_u64ne_to_le(pWav, 32);                    /* 24 for the GUID and size fields + 8 for the sample count. */
+            pWav->factChunkSampleCountPos = runningPos;
+            runningPos += drwav__write_u64ne_to_le(pWav, factSampleCount);
+        }
+    }
+
 
     if (!pWav->isSequentialWrite && pWav->pMetadata != NULL && pWav->metadataCount > 0 && (pFormat->container == drwav_container_riff || pFormat->container == drwav_container_rf64)) {
         runningPos += drwav__write_or_count_metadata(pWav, pWav->pMetadata, pWav->metadataCount);
     }
-
-    pWav->dataChunkDataPos = runningPos;
 
     /* "data" chunk. */
     if (pFormat->container == drwav_container_riff) {
@@ -4845,13 +4925,13 @@ DRWAV_API drwav_uint64 drwav_target_write_size_bytes(const drwav_data_format* pF
     drwav_uint64 fileSizeBytes = 0;
 
     if (pFormat->container == drwav_container_riff) {
-        riffChunkSizeBytes = drwav__riff_chunk_size_riff(targetDataSizeBytes, pMetadata, metadataCount);
+        riffChunkSizeBytes = drwav__riff_chunk_size_riff(targetDataSizeBytes, pMetadata, metadataCount, (drwav_uint16)pFormat->format);
         fileSizeBytes = (8 + riffChunkSizeBytes);   /* +8 because WAV doesn't include the size of the ChunkID and ChunkSize fields. */
     } else if (pFormat->container == drwav_container_w64) {
-        riffChunkSizeBytes = drwav__riff_chunk_size_w64(targetDataSizeBytes);
+        riffChunkSizeBytes = drwav__riff_chunk_size_w64(targetDataSizeBytes, (drwav_uint16)pFormat->format);
         fileSizeBytes = riffChunkSizeBytes;
     } else if (pFormat->container == drwav_container_rf64) {
-        riffChunkSizeBytes = drwav__riff_chunk_size_rf64(targetDataSizeBytes, pMetadata, metadataCount);
+        riffChunkSizeBytes = drwav__riff_chunk_size_rf64(targetDataSizeBytes, pMetadata, metadataCount, (drwav_uint16)pFormat->format);
         fileSizeBytes = (8 + riffChunkSizeBytes);   /* +8 because WAV doesn't include the size of the ChunkID and ChunkSize fields. */
     }
 
@@ -5875,10 +5955,19 @@ DRWAV_PRIVATE void drwav_write_chunk_sizes(drwav* pWav)
     to do this when using non-sequential mode.
     */
     if (pWav->onSeek != NULL && !pWav->isSequentialWrite) {
+        drwav_uint16 formatTag = pWav->fmt.formatTag;
+
+        /* The sample count in the "fact" chunk is the number of PCM frames (samples per channel). */
+        drwav_uint64 factSampleCount = 0;
+        drwav_uint32 bytesPerFrame = drwav_get_bytes_per_pcm_frame(pWav);
+        if (bytesPerFrame > 0) {
+            factSampleCount = pWav->dataChunkDataSize / bytesPerFrame;
+        }
+
         if (pWav->container == drwav_container_riff) {
             /* The "RIFF" chunk size. */
             if (pWav->onSeek(pWav->pUserData, 4, DRWAV_SEEK_SET)) {
-                drwav_uint32 riffChunkSize = drwav__riff_chunk_size_riff(pWav->dataChunkDataSize, pWav->pMetadata, pWav->metadataCount);
+                drwav_uint32 riffChunkSize = drwav__riff_chunk_size_riff(pWav->dataChunkDataSize, pWav->pMetadata, pWav->metadataCount, formatTag);
                 drwav__write_u32ne_to_le(pWav, riffChunkSize);
             }
 
@@ -5887,10 +5976,15 @@ DRWAV_PRIVATE void drwav_write_chunk_sizes(drwav* pWav)
                 drwav_uint32 dataChunkSize = drwav__data_chunk_size_riff(pWav->dataChunkDataSize);
                 drwav__write_u32ne_to_le(pWav, dataChunkSize);
             }
+
+            /* The "fact" chunk sample count. */
+            if (pWav->factChunkSampleCountPos != 0 && pWav->onSeek(pWav->pUserData, (int)pWav->factChunkSampleCountPos, DRWAV_SEEK_SET)) {
+                drwav__write_u32ne_to_le(pWav, (drwav_uint32)factSampleCount);
+            }
         } else if (pWav->container == drwav_container_w64) {
             /* The "RIFF" chunk size. */
             if (pWav->onSeek(pWav->pUserData, 16, DRWAV_SEEK_SET)) {
-                drwav_uint64 riffChunkSize = drwav__riff_chunk_size_w64(pWav->dataChunkDataSize);
+                drwav_uint64 riffChunkSize = drwav__riff_chunk_size_w64(pWav->dataChunkDataSize, formatTag);
                 drwav__write_u64ne_to_le(pWav, riffChunkSize);
             }
 
@@ -5899,13 +5993,18 @@ DRWAV_PRIVATE void drwav_write_chunk_sizes(drwav* pWav)
                 drwav_uint64 dataChunkSize = drwav__data_chunk_size_w64(pWav->dataChunkDataSize);
                 drwav__write_u64ne_to_le(pWav, dataChunkSize);
             }
+
+            /* The "fact" chunk sample count. */
+            if (pWav->factChunkSampleCountPos != 0 && pWav->onSeek(pWav->pUserData, (int)pWav->factChunkSampleCountPos, DRWAV_SEEK_SET)) {
+                drwav__write_u64ne_to_le(pWav, factSampleCount);
+            }
         } else if (pWav->container == drwav_container_rf64) {
             /* We only need to update the ds64 chunk. The "RIFF" and "data" chunks always have their sizes set to 0xFFFFFFFF for RF64. */
             int ds64BodyPos = 12 + 8;
 
             /* The "RIFF" chunk size. */
             if (pWav->onSeek(pWav->pUserData, ds64BodyPos + 0, DRWAV_SEEK_SET)) {
-                drwav_uint64 riffChunkSize = drwav__riff_chunk_size_rf64(pWav->dataChunkDataSize, pWav->pMetadata, pWav->metadataCount);
+                drwav_uint64 riffChunkSize = drwav__riff_chunk_size_rf64(pWav->dataChunkDataSize, pWav->pMetadata, pWav->metadataCount, formatTag);
                 drwav__write_u64ne_to_le(pWav, riffChunkSize);
             }
 
@@ -5913,6 +6012,11 @@ DRWAV_PRIVATE void drwav_write_chunk_sizes(drwav* pWav)
             if (pWav->onSeek(pWav->pUserData, ds64BodyPos + 8, DRWAV_SEEK_SET)) {
                 drwav_uint64 dataChunkSize = drwav__data_chunk_size_rf64(pWav->dataChunkDataSize);
                 drwav__write_u64ne_to_le(pWav, dataChunkSize);
+            }
+
+            /* The "fact" chunk sample count. */
+            if (pWav->factChunkSampleCountPos != 0 && pWav->onSeek(pWav->pUserData, (int)pWav->factChunkSampleCountPos, DRWAV_SEEK_SET)) {
+                drwav__write_u32ne_to_le(pWav, (drwav_uint32)factSampleCount);
             }
         }
     }
