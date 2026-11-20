@@ -531,13 +531,16 @@ This is equivalent to calling drmp3_get_mp3_frame_count() and drmp3_get_pcm_fram
 DRMP3_API drmp3_bool32 drmp3_get_mp3_and_pcm_frame_count(drmp3* pMP3, drmp3_uint64* pMP3FrameCount, drmp3_uint64* pPCMFrameCount);
 
 /*
-Calculates the seekpoints based on PCM frames. This is slow.
+Calculates the seekpoints based on PCM frames.
 
 pSeekpoint count is a pointer to a uint32 containing the seekpoint count. On input it contains the desired count.
 On output it contains the actual count. The reason for this design is that the client may request too many
 seekpoints, in which case dr_mp3 will return a corrected count.
 
-Note that seektable seeking is not quite sample exact when the MP3 stream contains inconsistent sample rates.
+Single-rate streams are measured by scanning MP3 frame headers rather than decoding audio, so generation is fast and every point lands on an
+exact frame boundary. Streams the header scan cannot measure exactly, including streams whose frames change sample rate, free-format
+frames, junk between frames, or truncated frames, use a slower decode-based pass. Both passes position points with integer frame math and
+stay sample-exact.
 */
 DRMP3_API drmp3_bool32 drmp3_calculate_seek_points(drmp3* pMP3, drmp3_uint32* pSeekPointCount, drmp3_seek_point* pSeekPoints);
 
@@ -4504,6 +4507,247 @@ static drmp3_bool32 drmp3_seek_to_start_of_stream(drmp3* pMP3)
 
 
 /*
+Header-only frame enumeration.
+
+This scanner walks the raw stream and parses only the 4-byte frame headers instead of decoding audio. Frame sizes and per-frame sample
+counts come straight from the header, with no decoding and no rounding, so every position is exact. Its results are only used for seek
+points on a single-rate stream: at a sample-rate boundary the decoder can resynchronize and drop or re-bound frames, so a header that
+looks valid here is not guaranteed to be where the decoder lands after a seek. The scanner reports whether any rate change was seen, and
+the caller routes such streams, along with any it cannot enumerate exactly (free-format frames, junk between frames, a truncated final
+frame), to the decode-based path, which stays sample-exact.
+
+The scanner keeps its own byte cursor and read buffer and never touches the decoder's stream cursor, so a single pass can both measure
+the stream and emit seek points, and it leaves the decoder position untouched.
+*/
+typedef struct
+{
+    drmp3_uint64 seekPosInBytes;    /* Absolute position of the frame's sync byte in the raw stream. */
+    drmp3_uint64 pcmFrameIndex;     /* Number of output PCM frames preceding this frame, counted with integer header math. */
+    drmp3_uint64 mp3FrameIndex;     /* Zero-based index of the frame among all frames in the stream. */
+    drmp3_uint32 sampleRate;        /* Sample rate carried by this frame's header. */
+    drmp3_uint32 frameSamples;      /* PCM frames this frame outputs: 384 for Layer I, otherwise 1152 or 576. */
+} drmp3__mp3_frame_position;
+
+#define DRMP3__HEADER_SCAN_CHUNK_SIZE  4096
+
+typedef struct
+{
+    drmp3_uint8 buffer[DRMP3__HEADER_SCAN_CHUNK_SIZE + 4];
+    drmp3_uint64 bufferOrigin;       /* Absolute stream position of buffer[0]. */
+    drmp3_uint32 bufferSize;         /* Valid bytes currently in the buffer. */
+    drmp3_uint64 cursor;             /* Absolute stream position of the next byte to inspect. */
+    drmp3_uint64 endOfStream;        /* DRMP3_UINT64_MAX when the length is unknown. */
+} drmp3__header_scan;
+
+/* Loads the chunk holding bytePos into the scan buffer. Returns DRMP3_FALSE on a read failure. */
+static drmp3_bool32 drmp3__header_scan_refill(drmp3* pMP3, drmp3__header_scan* pScan, drmp3_uint64 bytePos)
+{
+    drmp3_uint64 readPos;
+    size_t bytesRead;
+
+    if (pMP3->memory.pData != NULL && pMP3->memory.dataSize > 0) {
+        if (bytePos >= (drmp3_uint64)pMP3->memory.dataSize) {
+            return DRMP3_FALSE;
+        }
+
+        readPos = bytePos;
+        pScan->bufferSize = (drmp3_uint32)DRMP3_MIN((drmp3_uint64)DRMP3__HEADER_SCAN_CHUNK_SIZE, (drmp3_uint64)pMP3->memory.dataSize - readPos);
+        DRMP3_COPY_MEMORY(pScan->buffer, pMP3->memory.pData + readPos, pScan->bufferSize);
+    } else {
+        readPos = bytePos;
+        if (pScan->endOfStream != DRMP3_UINT64_MAX && readPos >= pScan->endOfStream) {
+            return DRMP3_FALSE;
+        }
+
+        if (!drmp3__on_seek_64(pMP3, readPos, DRMP3_SEEK_SET)) {
+            return DRMP3_FALSE;
+        }
+
+        bytesRead = drmp3__on_read_clamped(pMP3, pScan->buffer, DRMP3__HEADER_SCAN_CHUNK_SIZE);
+        if (bytesRead == 0) {
+            return DRMP3_FALSE;
+        }
+
+        pScan->bufferSize = (drmp3_uint32)bytesRead;
+    }
+
+    pScan->bufferOrigin = readPos;
+    return DRMP3_TRUE;
+}
+
+/* Copies the four header bytes at absolute position bytePos into headerOut. */
+static drmp3_bool32 drmp3__header_scan_read4(drmp3* pMP3, drmp3__header_scan* pScan, drmp3_uint64 bytePos, drmp3_uint8 headerOut[4])
+{
+    drmp3_uint64 offset;
+
+    if (pScan->endOfStream != DRMP3_UINT64_MAX) {
+        if (bytePos > pScan->endOfStream || pScan->endOfStream - bytePos < 4) {
+            return DRMP3_FALSE;  /* Not enough stream left for a whole header. */
+        }
+    }
+
+    if (pScan->bufferSize == 0 || bytePos < pScan->bufferOrigin ||
+        bytePos + 4 > pScan->bufferOrigin + (drmp3_uint64)pScan->bufferSize) {
+        if (!drmp3__header_scan_refill(pMP3, pScan, bytePos)) {
+            return DRMP3_FALSE;
+        }
+    }
+
+    offset = bytePos - pScan->bufferOrigin;
+    if (offset + 4 > (drmp3_uint64)pScan->bufferSize) {
+        return DRMP3_FALSE;  /* Short read: the stream ends mid-header. */
+    }
+
+    DRMP3_COPY_MEMORY(headerOut, pScan->buffer + offset, 4);
+    return DRMP3_TRUE;
+}
+
+/*
+Enumerates every MP3 frame in the stream by parsing headers only. Never decodes audio.
+
+pFrameCount and pPCMFrameCount, when non-NULL, receive the exact totals measured in MP3 frames and output PCM frames respectively.
+When onFrame is non-NULL it is invoked once per frame in stream order, which lets the caller build a seek table in the same single pass.
+
+Streams that cannot be enumerated exactly from headers alone are reported as DRMP3_FALSE so the caller can fall back to the slower
+decode-based path, which remains sample-exact. That includes free-format frames whose sizes require sync scanning, truncated frames,
+and (in strict mode) any resync over non-frame data which the decoder might account for differently.
+*/
+static drmp3_bool32 drmp3__enumerate_frame_headers(drmp3* pMP3, drmp3_bool32 strict, drmp3_bool32 (*onFrame)(drmp3* pMP3, const drmp3__mp3_frame_position* pPosition, void* pUserData), void* pUserData, drmp3_uint64* pFrameCount, drmp3_uint64* pPCMFrameCount, drmp3_bool32* pHasSampleRateChange)
+{
+    drmp3__header_scan scan;
+    drmp3_uint64 runningPCMFrameCount;
+    drmp3_uint64 runningMP3FrameCount;
+    drmp3_uint32 firstSampleRate;
+    drmp3_bool32 sampleRateChanged;
+
+    DRMP3_ASSERT(pMP3 != NULL);
+
+    firstSampleRate   = 0;
+    sampleRateChanged = DRMP3_FALSE;
+
+    scan.bufferSize   = 0;
+    scan.bufferOrigin = 0;
+    scan.cursor       = pMP3->streamStartOffset;
+
+    if (pMP3->memory.pData != NULL && pMP3->memory.dataSize > 0) {
+        scan.endOfStream = (drmp3_uint64)pMP3->memory.dataSize;
+    } else {
+        scan.endOfStream = pMP3->streamLength;  /* May be DRMP3_UINT64_MAX for an unknown length. */
+    }
+
+    runningPCMFrameCount = 0;
+    runningMP3FrameCount = 0;
+
+    for (;;) {
+        drmp3_uint8 header[4];
+        drmp3_uint32 frameBytes;
+        drmp3_uint32 frameSamples;
+
+        if (scan.cursor == scan.endOfStream) {
+            break;  /* Clean end of stream. */
+        }
+
+        if (!drmp3__header_scan_read4(pMP3, &scan, scan.cursor, header)) {
+            if (scan.endOfStream != DRMP3_UINT64_MAX || scan.cursor != pMP3->streamStartOffset) {
+                return DRMP3_FALSE;  /* Truncated header, or junk the header parser cannot resync over. */
+            }
+
+            break;  /* Unreadable first header on an unknown-length stream. */
+        }
+
+        if (!drmp3_hdr_valid(header)) {
+            if (strict) {
+                return DRMP3_FALSE;  /* Non-frame data: let the decode-based path account for it exactly. */
+            }
+
+            /* Not a frame sync. Resync one byte at a time, the same way the decoder does. */
+            scan.cursor += 1;
+            continue;
+        }
+
+        /*
+        Free-format frame sizes cannot be derived from the header alone; they require sync scanning of the raw data. Leave those to the
+        decode-based fallback which knows how to measure them.
+        */
+        if (DRMP3_HDR_IS_FREE_FORMAT(header)) {
+            return DRMP3_FALSE;
+        }
+
+        frameBytes = (drmp3_uint32)drmp3_hdr_frame_bytes(header, 0) + (drmp3_uint32)drmp3_hdr_padding(header);
+        if (frameBytes < DRMP3_HDR_SIZE || frameBytes == 0) {
+            return DRMP3_FALSE;
+        }
+
+        if (scan.endOfStream != DRMP3_UINT64_MAX) {
+            if (scan.cursor > scan.endOfStream || (drmp3_uint64)frameBytes > scan.endOfStream - scan.cursor) {
+                return DRMP3_FALSE;  /* The frame runs past the end of the stream. */
+            }
+        }
+
+        /*
+        Require the frame to be followed by either another valid frame or the exact end of the stream. This mirrors minimp3's sync
+        matching and rejects false syncs inside junk data without having to decode anything.
+        */
+        if (scan.endOfStream != DRMP3_UINT64_MAX && scan.cursor + (drmp3_uint64)frameBytes < scan.endOfStream) {
+            drmp3_uint8 nextHeader[4];
+
+            if (!drmp3__header_scan_read4(pMP3, &scan, scan.cursor + (drmp3_uint64)frameBytes, nextHeader) || !drmp3_hdr_valid(nextHeader)) {
+                if (strict) {
+                    return DRMP3_FALSE;
+                }
+
+                /* Presumed false sync. Resync a byte at a time. */
+                scan.cursor += 1;
+                continue;
+            }
+        }
+
+        frameSamples = (drmp3_uint32)drmp3_hdr_frame_samples(header);
+
+        /*
+        Track whether every frame shares one sample rate. A rate change makes header-only byte positions unreliable: at the boundary the
+        decoder resynchronizes and may drop or re-bound frames, so the builder must take the decode-based path instead.
+        */
+        if (firstSampleRate == 0) {
+            firstSampleRate = drmp3_hdr_sample_rate_hz(header);
+        } else if (drmp3_hdr_sample_rate_hz(header) != firstSampleRate) {
+            sampleRateChanged = DRMP3_TRUE;
+        }
+
+        if (onFrame != NULL) {
+            drmp3__mp3_frame_position position;
+
+            position.seekPosInBytes = scan.cursor;
+            position.pcmFrameIndex  = runningPCMFrameCount;
+            position.mp3FrameIndex  = runningMP3FrameCount;
+            position.sampleRate     = drmp3_hdr_sample_rate_hz(header);
+            position.frameSamples   = frameSamples;
+
+            if (!onFrame(pMP3, &position, pUserData)) {
+                return DRMP3_FALSE;
+            }
+        }
+
+        runningPCMFrameCount += frameSamples;
+        runningMP3FrameCount += 1;
+        scan.cursor          += frameBytes;
+    }
+
+    if (pFrameCount != NULL) {
+        *pFrameCount = runningMP3FrameCount;
+    }
+    if (pPCMFrameCount != NULL) {
+        *pPCMFrameCount = runningPCMFrameCount;
+    }
+    if (pHasSampleRateChange != NULL) {
+        *pHasSampleRateChange = sampleRateChanged;
+    }
+
+    return DRMP3_TRUE;
+}
+
+
+/*
 The PCM frame the next read returns, as the caller counts them. currentPCMFrame also counts the delay frames that reading skips at the
 start of the stream, so it runs ahead by up to delayInPCMFrames.
 */
@@ -4792,46 +5036,39 @@ DRMP3_API drmp3_uint64 drmp3_get_mp3_frame_count(drmp3* pMP3)
     return totalMP3FrameCount;
 }
 
-static void drmp3__accumulate_running_pcm_frame_count(drmp3* pMP3, drmp3_uint32 pcmFrameCountIn, drmp3_uint64* pRunningPCMFrameCount, float* pRunningPCMFrameCountFractionalPart)
+/*
+dr_mp3 never resamples: every decoded MP3 frame is output at its own native sample count, so the running PCM position is simply the sum of
+the frames' sample counts. Counting with integers keeps the position exact even when consecutive frames change sample rate, where the old
+floating point srcRatio accumulation drifted.
+*/
+static void drmp3__accumulate_running_pcm_frame_count(drmp3* pMP3, drmp3_uint32 pcmFrameCountIn, drmp3_uint64* pRunningPCMFrameCount)
 {
-    float srcRatio;
-    float pcmFrameCountOutF;
-    drmp3_uint32 pcmFrameCountOut;
+    (void)pMP3;
+    DRMP3_ASSERT(pcmFrameCountIn > 0);
 
-    srcRatio = (float)pMP3->mp3FrameSampleRate / (float)pMP3->sampleRate;
-    DRMP3_ASSERT(srcRatio > 0);
-
-    pcmFrameCountOutF = *pRunningPCMFrameCountFractionalPart + (pcmFrameCountIn / srcRatio);
-    pcmFrameCountOut  = (drmp3_uint32)pcmFrameCountOutF;
-    *pRunningPCMFrameCountFractionalPart = pcmFrameCountOutF - pcmFrameCountOut;
-    *pRunningPCMFrameCount += pcmFrameCountOut;
+    *pRunningPCMFrameCount += (drmp3_uint64)pcmFrameCountIn;
 }
 
 typedef struct
 {
     drmp3_uint64 bytePos;
-    drmp3_uint64 pcmFrameIndex; /* <-- After sample rate conversion. */
+    drmp3_uint64 pcmFrameIndex;
     drmp3_uint64 mp3FrameIndex;
+    drmp3_uint32 sampleRate;
 } drmp3__seeking_mp3_frame_info;
 
-DRMP3_API drmp3_bool32 drmp3_calculate_seek_points(drmp3* pMP3, drmp3_uint32* pSeekPointCount, drmp3_seek_point* pSeekPoints)
+/*
+Decode-based seek point calculation. This decodes every frame, which is slower than the header-only scan, but both the byte positions and
+the PCM frame counts come from the decoder itself, so the points stay frame-exact even when frames change sample rate or the decoder
+resynchronizes at a boundary. The PCM position is accumulated with integer frame counts rather than floating point so it cannot drift.
+*/
+static drmp3_bool32 drmp3__calculate_seek_points__decode(drmp3* pMP3, drmp3_uint32* pSeekPointCount, drmp3_seek_point* pSeekPoints, drmp3_uint64 currentPCMFrame)
 {
     drmp3_uint32 seekPointCount;
-    drmp3_uint64 currentPCMFrame;
     drmp3_uint64 totalMP3FrameCount;
     drmp3_uint64 totalPCMFrameCount;
 
-    if (pMP3 == NULL || pSeekPointCount == NULL || pSeekPoints == NULL) {
-        return DRMP3_FALSE; /* Invalid args. */
-    }
-
     seekPointCount = *pSeekPointCount;
-    if (seekPointCount == 0) {
-        return DRMP3_FALSE;  /* The client has requested no seek points. Consider this to be invalid arguments since the client has probably not intended this. */
-    }
-
-    /* We'll need to seek back to the current sample after calculating the seekpoints so we need to go ahead and grab the current location at the top. */
-    currentPCMFrame = drmp3_get_cursor_in_pcm_frames(pMP3);
 
     /* We never do more than the total number of MP3 frames and we limit it to 32-bits. */
     if (!drmp3_get_mp3_and_pcm_frame_count(pMP3, &totalMP3FrameCount, &totalPCMFrameCount)) {
@@ -4850,7 +5087,6 @@ DRMP3_API drmp3_bool32 drmp3_calculate_seek_points(drmp3* pMP3, drmp3_uint32* pS
         drmp3__seeking_mp3_frame_info mp3FrameInfo[DRMP3_SEEK_LEADING_MP3_FRAMES+1];
         drmp3_uint32 mp3FrameInfoCount = 0;
         drmp3_uint64 runningPCMFrameCount = 0;
-        float runningPCMFrameCountFractionalPart = 0;
         drmp3_uint64 runningMP3FrameCount = 0;
         drmp3_uint64 nextTargetPCMFrame;
         drmp3_uint32 iSeekPoint;
@@ -4883,7 +5119,7 @@ DRMP3_API drmp3_bool32 drmp3_calculate_seek_points(drmp3* pMP3, drmp3_uint32* pS
                     for (i = 0; i < DRMP3_COUNTOF(mp3FrameInfo)-1; ++i) {
                         mp3FrameInfo[i] = mp3FrameInfo[i+1];
                     }
-                    
+
                     mp3FrameInfoCount -= 1;
                 }
 
@@ -4892,6 +5128,7 @@ DRMP3_API drmp3_bool32 drmp3_calculate_seek_points(drmp3* pMP3, drmp3_uint32* pS
                 mp3FrameInfo[mp3FrameInfoCount].bytePos       = pMP3->streamCursor - pMP3->dataSize;
                 mp3FrameInfo[mp3FrameInfoCount].pcmFrameIndex = runningPCMFrameCount;
                 mp3FrameInfo[mp3FrameInfoCount].mp3FrameIndex = runningMP3FrameCount;
+                mp3FrameInfo[mp3FrameInfoCount].sampleRate    = pMP3->mp3FrameSampleRate;
 
                 /* This shouldn't ever fail, but just in case it does we set the seek point on the last frame. */
                 pcmFramesInCurrentMP3FrameIn = drmp3_decode_next_frame_ex(pMP3, NULL, NULL, NULL);
@@ -4901,14 +5138,42 @@ DRMP3_API drmp3_bool32 drmp3_calculate_seek_points(drmp3* pMP3, drmp3_uint32* pS
 
                 mp3FrameInfoCount    += 1;
                 runningMP3FrameCount += 1 + pMP3->mp3FramesSkipped;
-                drmp3__accumulate_running_pcm_frame_count(pMP3, pcmFramesInCurrentMP3FrameIn, &runningPCMFrameCount, &runningPCMFrameCountFractionalPart);
+                drmp3__accumulate_running_pcm_frame_count(pMP3, pcmFramesInCurrentMP3FrameIn, &runningPCMFrameCount);
             }
 
-            DRMP3_ASSERT(mp3FrameInfoCount > 0);
-            pSeekPoints[iSeekPoint].seekPosInBytes     = mp3FrameInfo[0].bytePos;
-            pSeekPoints[iSeekPoint].pcmFrameIndex      = nextTargetPCMFrame;
-            pSeekPoints[iSeekPoint].mp3FramesToDiscard = (drmp3_uint16)(mp3FrameInfo[mp3FrameInfoCount-1].mp3FrameIndex - mp3FrameInfo[0].mp3FrameIndex);
-            pSeekPoints[iSeekPoint].pcmFramesToDiscard = (drmp3_uint16)(nextTargetPCMFrame - mp3FrameInfo[mp3FrameInfoCount-1].pcmFrameIndex);
+            {
+                /*
+                The anchor is the frame the seek physically jumps to. It must live in the target frame's own sample-rate block: after a
+                seek the decoder rebuilds its bit reservoir from the discarded frames, and decoding across a sample-rate switch does not
+                reproduce the linear-read decoder state, which corrupts the output. Walk back over the ring only while frames still share
+                the target's rate; if the block offers fewer history frames than the ring, the anchor simply becomes the block's first
+                frame, and the runtime's own fallback handles any point that ends up with too little warm-up.
+                */
+                drmp3_uint32 targetIndex;
+                drmp3_uint32 anchorIndex;
+                drmp3_uint64 mp3FramesToDiscard;
+                drmp3_uint64 pcmFramesToDiscard;
+
+                DRMP3_ASSERT(mp3FrameInfoCount > 0);
+                targetIndex = mp3FrameInfoCount - 1;
+                anchorIndex = targetIndex;
+                while (anchorIndex > 0 && mp3FrameInfo[anchorIndex-1].sampleRate == mp3FrameInfo[targetIndex].sampleRate) {
+                    anchorIndex -= 1;
+                }
+
+                mp3FramesToDiscard = mp3FrameInfo[targetIndex].mp3FrameIndex - mp3FrameInfo[anchorIndex].mp3FrameIndex;
+                pcmFramesToDiscard = nextTargetPCMFrame - mp3FrameInfo[targetIndex].pcmFrameIndex;
+
+                /* The seek point's discard counters are 16-bit. If either would not fit, this point cannot be represented exactly. */
+                if (mp3FramesToDiscard > 0xFFFF || pcmFramesToDiscard > 0xFFFF) {
+                    return DRMP3_FALSE;
+                }
+
+                pSeekPoints[iSeekPoint].seekPosInBytes     = mp3FrameInfo[anchorIndex].bytePos;
+                pSeekPoints[iSeekPoint].pcmFrameIndex      = nextTargetPCMFrame;
+                pSeekPoints[iSeekPoint].mp3FramesToDiscard = (drmp3_uint16)mp3FramesToDiscard;
+                pSeekPoints[iSeekPoint].pcmFramesToDiscard = (drmp3_uint16)pcmFramesToDiscard;
+            }
         }
 
         /* Finally, we need to seek back to where we were. */
@@ -4922,6 +5187,245 @@ DRMP3_API drmp3_bool32 drmp3_calculate_seek_points(drmp3* pMP3, drmp3_uint32* pS
 
     *pSeekPointCount = seekPointCount;
     return DRMP3_TRUE;
+}
+
+/*
+State for the header-only seek point builder. A fixed-size ring of the most recent MP3 frames lets each seek point anchor up to
+DRMP3_SEEK_LEADING_MP3_FRAMES frames before its target frame, so the decoder has enough history when it jumps.
+*/
+typedef struct
+{
+    drmp3__mp3_frame_position ring[DRMP3_SEEK_LEADING_MP3_FRAMES+1];
+    drmp3_uint32 ringCount;
+    drmp3_uint64 pcmFramesBetweenSeekPoints;
+    drmp3_uint32 seekPointCount;
+    drmp3_uint32 nextSeekPoint;
+    drmp3_uint64 nextTargetPCMFrame;
+    drmp3_seek_point* pSeekPoints;
+} drmp3__seek_table_builder;
+
+static drmp3_bool32 drmp3__seek_table_builder_on_frame(drmp3* pMP3, const drmp3__mp3_frame_position* pPosition, void* pUserData)
+{
+    drmp3__seek_table_builder* pBuilder = (drmp3__seek_table_builder*)pUserData;
+
+    (void)pMP3;
+
+    if (pBuilder->ringCount == DRMP3_COUNTOF(pBuilder->ring)) {
+        size_t i;
+
+        for (i = 0; i < DRMP3_COUNTOF(pBuilder->ring)-1; ++i) {
+            pBuilder->ring[i] = pBuilder->ring[i+1];
+        }
+
+        pBuilder->ringCount -= 1;
+    }
+
+    pBuilder->ring[pBuilder->ringCount] = *pPosition;
+    pBuilder->ringCount += 1;
+
+    /*
+    Emit the seek points whose target PCM frame is held by this MP3 frame. A frame holds every target in
+    [pPosition->pcmFrameIndex, pPosition->pcmFrameIndex + frameSamples). Targets at or beyond the frame's end are deferred to a later
+    frame callback, where the ring will already contain that later frame, so a point is never assigned to the wrong frame.
+    */
+    while (pBuilder->nextSeekPoint < pBuilder->seekPointCount &&
+           pBuilder->nextTargetPCMFrame >= pPosition->pcmFrameIndex &&
+           pBuilder->nextTargetPCMFrame <  pPosition->pcmFrameIndex + pPosition->frameSamples) {
+        drmp3_seek_point* pSeekPoint;
+        const drmp3__mp3_frame_position* pTargetFrame;
+        const drmp3__mp3_frame_position* pAnchor;
+        drmp3_uint32 iRing;
+        drmp3_uint32 blockStartRing;
+        drmp3_uint64 mp3FramesToDiscard;
+        drmp3_uint64 pcmFramesToDiscard;
+
+        pSeekPoint   = pBuilder->pSeekPoints + pBuilder->nextSeekPoint;
+        pTargetFrame = pPosition;  /* The frame holding the target PCM frame. */
+
+        /*
+        Find the earliest ring entry that belongs to the target frame's sample-rate block. The anchor must not sit in an earlier block:
+        the decoder rebuilds its bit reservoir from the discarded frames, and decoding across a sample-rate switch does not reproduce the
+        linear-read decoder state, which corrupts the output.
+        */
+        blockStartRing = pBuilder->ringCount-1;
+        for (iRing = pBuilder->ringCount-1; iRing > 0; --iRing) {
+            if (pBuilder->ring[iRing-1].sampleRate != pTargetFrame->sampleRate) {
+                break;  /* ring[iRing-1] is the last frame of the preceding sample-rate block. */
+            }
+
+            blockStartRing = iRing-1;
+        }
+
+        /*
+        Choose the anchor, the frame the seek will physically jump to. It is normally up to DRMP3_SEEK_LEADING_MP3_FRAMES frames before
+        the target frame so the decoder warms up with real history. Both discard counters are 16-bit, however: the PCM discard is measured
+        in single samples, so on blocks of small (for example 576-sample) frames it can overflow. Walk the anchor forward, still inside the
+        same sample-rate block, until both discard counts fit. Moving the anchor forward trades PCM discard for whole MP3-frame discard,
+        which is bounded by the frame count. If even the target frame itself overflows the 16-bit frame counter the table cannot represent
+        this point and the caller falls back to the decode-based path.
+        */
+        pAnchor = &pBuilder->ring[pBuilder->ringCount-1];  /* Default: the target frame itself. */
+        for (iRing = blockStartRing; iRing < pBuilder->ringCount; ++iRing) {
+            drmp3_uint64 leadFrames;
+
+            leadFrames = pTargetFrame->mp3FrameIndex - pBuilder->ring[iRing].mp3FrameIndex;
+            if (leadFrames > DRMP3_SEEK_LEADING_MP3_FRAMES) {
+                continue;  /* Too far before the target; keep looking for a closer frame. */
+            }
+
+            pAnchor = &pBuilder->ring[iRing];
+            break;
+        }
+
+        mp3FramesToDiscard = pTargetFrame->mp3FrameIndex - pAnchor->mp3FrameIndex;
+        pcmFramesToDiscard = pBuilder->nextTargetPCMFrame - pTargetFrame->pcmFrameIndex;
+
+        /* If the PCM discard does not fit, advance the anchor frame by frame to absorb whole frames until it does. */
+        while (pcmFramesToDiscard > 0xFFFF) {
+            drmp3_uint64 anchorRing;
+            drmp3_uint64 frameSamples;
+
+            anchorRing = (drmp3_uint64)(pAnchor - &pBuilder->ring[0]);
+            if (anchorRing + 1 >= pBuilder->ringCount) {
+                return DRMP3_FALSE;  /* No later frame available within the ring. Fall back to the decode path. */
+            }
+
+            frameSamples = pBuilder->ring[anchorRing+1].pcmFrameIndex - pBuilder->ring[anchorRing].pcmFrameIndex;
+            if (frameSamples == 0 || frameSamples > pcmFramesToDiscard) {
+                return DRMP3_FALSE;  /* Cannot make progress without overshooting the target. */
+            }
+
+            pAnchor = &pBuilder->ring[anchorRing+1];
+            pcmFramesToDiscard  -= frameSamples;
+            mp3FramesToDiscard  += 1;
+        }
+
+        if (mp3FramesToDiscard > 0xFFFF || pcmFramesToDiscard > 0xFFFF) {
+            return DRMP3_FALSE;  /* Would truncate a 16-bit discard field. Falls back to the decode path. */
+        }
+
+        pSeekPoint->seekPosInBytes     = pAnchor->seekPosInBytes;
+        pSeekPoint->pcmFrameIndex      = pBuilder->nextTargetPCMFrame;
+        pSeekPoint->mp3FramesToDiscard = (drmp3_uint16)mp3FramesToDiscard;
+        pSeekPoint->pcmFramesToDiscard = (drmp3_uint16)pcmFramesToDiscard;
+
+        pBuilder->nextSeekPoint      += 1;
+        pBuilder->nextTargetPCMFrame += pBuilder->pcmFramesBetweenSeekPoints;
+    }
+
+    return DRMP3_TRUE;
+}
+
+/*
+Fast, frame-exact seek point generation.
+
+A single header-only pass measures every frame's byte position and PCM frame index with integer arithmetic, so mixed sample-rate
+streams cannot drift and no audio is ever decoded. Returns DRMP3_FALSE for streams the header scanner cannot handle exactly; the caller
+then uses the decode-based fallback. The scanner keeps its own cursor, so the decoder's stream position is restored afterwards with the
+same seek sequence as the decode-based path.
+*/
+static drmp3_bool32 drmp3__calculate_seek_points__headers(drmp3* pMP3, drmp3_uint32* pSeekPointCount, drmp3_seek_point* pSeekPoints, drmp3_uint64 currentPCMFrame)
+{
+    drmp3_uint32 seekPointCount;
+    drmp3_uint64 totalMP3FrameCount;
+    drmp3_uint64 totalPCMFrameCount;
+    drmp3__seek_table_builder builder;
+    drmp3_uint64 pcmFramesBetweenSeekPoints;
+    drmp3_bool32 hasSampleRateChange;
+
+    seekPointCount = *pSeekPointCount;
+
+    /*
+    A first strict scan measures the exact totals. It only parses headers, so this and the build pass below are both cheap relative to
+    decoding. Anything the scanner rejects means this stream needs the decode path.
+    */
+    if (!drmp3__enumerate_frame_headers(pMP3, DRMP3_TRUE, NULL, NULL, &totalMP3FrameCount, &totalPCMFrameCount, &hasSampleRateChange)) {
+        return DRMP3_FALSE;
+    }
+
+    if (totalMP3FrameCount == 0) {
+        return DRMP3_FALSE;
+    }
+
+    /*
+    The header-only path is only exact on a single-rate stream. At a sample-rate boundary the decoder resynchronizes and can drop or
+    re-bound frames, so a frame that looks valid to the header scanner is not necessarily where the decoder lands after a seek. Hand such
+    streams to the decode-based path, whose byte positions and PCM counts both come from the decoder itself.
+    */
+    if (hasSampleRateChange) {
+        return DRMP3_FALSE;
+    }
+
+    /* If there's less than DRMP3_SEEK_LEADING_MP3_FRAMES+1 frames we just report 1 seek point which will be the very start of the stream. */
+    if (totalMP3FrameCount < DRMP3_SEEK_LEADING_MP3_FRAMES+1) {
+        seekPointCount = 1;
+        pSeekPoints[0].seekPosInBytes     = pMP3->streamStartOffset;
+        pSeekPoints[0].pcmFrameIndex      = 0;
+        pSeekPoints[0].mp3FramesToDiscard = 0;
+        pSeekPoints[0].pcmFramesToDiscard = 0;
+    } else {
+        if (seekPointCount > totalMP3FrameCount-1) {
+            seekPointCount = (drmp3_uint32)totalMP3FrameCount-1;
+        }
+
+        pcmFramesBetweenSeekPoints = totalPCMFrameCount / (seekPointCount+1);
+        if (pcmFramesBetweenSeekPoints == 0) {
+            return DRMP3_FALSE;  /* More requested points than PCM frames can space out. Fall back. */
+        }
+
+        DRMP3_ZERO_OBJECT(&builder);
+        builder.pcmFramesBetweenSeekPoints  = pcmFramesBetweenSeekPoints;
+        builder.seekPointCount              = seekPointCount;
+        builder.nextSeekPoint               = 0;
+        builder.nextTargetPCMFrame          = pcmFramesBetweenSeekPoints;
+        builder.pSeekPoints                 = pSeekPoints;
+
+        /* The scanner owns its own cursor, so this build pass never disturbs the decoder's stream position. */
+        if (!drmp3__enumerate_frame_headers(pMP3, DRMP3_TRUE, drmp3__seek_table_builder_on_frame, &builder, NULL, NULL, NULL)) {
+            return DRMP3_FALSE;  /* A discard field would overflow, or the stream changed. Fall back. */
+        }
+
+        if (builder.nextSeekPoint != seekPointCount) {
+            return DRMP3_FALSE;  /* Could not place every requested point. Fall back rather than emit a partial table. */
+        }
+    }
+
+    /* Restore the decoder to the frame it was sitting on before the calculation. */
+    if (!drmp3_seek_to_start_of_stream(pMP3)) {
+        return DRMP3_FALSE;
+    }
+    if (!drmp3_seek_to_pcm_frame(pMP3, currentPCMFrame)) {
+        return DRMP3_FALSE;
+    }
+
+    *pSeekPointCount = seekPointCount;
+    return DRMP3_TRUE;
+}
+
+DRMP3_API drmp3_bool32 drmp3_calculate_seek_points(drmp3* pMP3, drmp3_uint32* pSeekPointCount, drmp3_seek_point* pSeekPoints)
+{
+    drmp3_uint64 currentPCMFrame;
+
+    if (pMP3 == NULL || pSeekPointCount == NULL || pSeekPoints == NULL) {
+        return DRMP3_FALSE; /* Invalid args. */
+    }
+
+    if (*pSeekPointCount == 0) {
+        return DRMP3_FALSE;  /* The client has requested no seek points. Consider this to be invalid arguments since the client has probably not intended this. */
+    }
+
+    /* We'll need to seek back to the current sample after calculating the seekpoints so we need to go ahead and grab the current location at the top. */
+    currentPCMFrame = drmp3_get_cursor_in_pcm_frames(pMP3);
+
+    /*
+    Prefer the header-only pass: it never decodes audio so it is much faster, and it positions points with integer frame math which stays
+    exact on streams whose frames change sample rate. Streams the scanner cannot handle exactly fall back to the decode-based generator.
+    */
+    if (drmp3__calculate_seek_points__headers(pMP3, pSeekPointCount, pSeekPoints, currentPCMFrame)) {
+        return DRMP3_TRUE;
+    }
+
+    return drmp3__calculate_seek_points__decode(pMP3, pSeekPointCount, pSeekPoints, currentPCMFrame);
 }
 
 DRMP3_API drmp3_bool32 drmp3_bind_seek_table(drmp3* pMP3, drmp3_uint32 seekPointCount, drmp3_seek_point* pSeekPoints)
