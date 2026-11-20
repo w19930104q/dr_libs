@@ -133,6 +133,15 @@ Notes
 - The default read function does not do any data conversion. Use `drwav_read_pcm_frames_f32()`, `drwav_read_pcm_frames_s32()` and `drwav_read_pcm_frames_s16()`
   to read and convert audio data to 32-bit floating point, signed 32-bit integer and signed 16-bit integer samples respectively.
 - dr_wav will try to read the WAV file as best it can, even if it's not strictly conformant to the WAV format.
+- When a WAVE_FORMAT_EXTENSIBLE file specifies a channel mask, decoded channels are reordered into dr_wav's canonical
+  channel order, which is:
+
+      FL, FR, BL, BR, FC, LFE, SL, SR, BC, FLC, FRC, TC, TFL, TFC, TFR, TBL, TBC, TBR
+
+  Only the speakers present in the mask are output, in the relative order above. The channel mask itself is exposed
+  verbatim via `drwav.channelMask` (and `drwav_fmt.channelMask`) and can be interpreted with the DRWAV_SPEAKER_* flags.
+  Files without a channel mask, or with a mask dr_wav doesn't recognize (unknown bits set, or a bit count that doesn't
+  match the channel count), are decoded in their original channel order.
 */
 
 #ifndef dr_wav_h
@@ -287,6 +296,27 @@ typedef drwav_int32 drwav_result;
 #define DR_WAVE_FORMAT_DVI_ADPCM    0x11
 #define DR_WAVE_FORMAT_EXTENSIBLE   0xFFFE
 
+/* Speaker position flags for use with the channel mask (drwav.channelMask and drwav_fmt.channelMask). */
+#define DRWAV_SPEAKER_FRONT_LEFT                0x00000001
+#define DRWAV_SPEAKER_FRONT_RIGHT               0x00000002
+#define DRWAV_SPEAKER_FRONT_CENTER              0x00000004
+#define DRWAV_SPEAKER_LFE                       0x00000008
+#define DRWAV_SPEAKER_BACK_LEFT                 0x00000010
+#define DRWAV_SPEAKER_BACK_RIGHT                0x00000020
+#define DRWAV_SPEAKER_FRONT_LEFT_OF_CENTER      0x00000040
+#define DRWAV_SPEAKER_FRONT_RIGHT_OF_CENTER     0x00000080
+#define DRWAV_SPEAKER_BACK_CENTER               0x00000100
+#define DRWAV_SPEAKER_SIDE_LEFT                 0x00000200
+#define DRWAV_SPEAKER_SIDE_RIGHT                0x00000400
+#define DRWAV_SPEAKER_TOP_CENTER                0x00000800
+#define DRWAV_SPEAKER_TOP_FRONT_LEFT            0x00001000
+#define DRWAV_SPEAKER_TOP_FRONT_CENTER          0x00002000
+#define DRWAV_SPEAKER_TOP_FRONT_RIGHT           0x00004000
+#define DRWAV_SPEAKER_TOP_BACK_LEFT             0x00008000
+#define DRWAV_SPEAKER_TOP_BACK_CENTER           0x00010000
+#define DRWAV_SPEAKER_TOP_BACK_RIGHT            0x00020000
+#define DRWAV_SPEAKER_ALL                       0x0003FFFF
+
 /* Flags to pass into drwav_init_ex(), etc. */
 #define DRWAV_SEQUENTIAL            0x00000001
 #define DRWAV_WITH_METADATA         0x00000002
@@ -371,7 +401,11 @@ typedef struct
     */
     drwav_uint16 validBitsPerSample;
 
-    /* The channel mask. Not used at the moment. */
+    /*
+    The channel mask. Only relevant when <formatTag> is equal to WAVE_FORMAT_EXTENSIBLE; set to 0 otherwise.
+    When reading, dr_wav uses this to reorder channels into its canonical channel order. Interpret with the
+    DRWAV_SPEAKER_* flags.
+    */
     drwav_uint32 channelMask;
 
     /* The sub-format, exactly as specified by the wave file. */
@@ -897,6 +931,13 @@ typedef struct
     /* Equal to fmt.formatTag, or the value specified by fmt.subFormat if fmt.formatTag is equal to 65534 (WAVE_FORMAT_EXTENSIBLE). */
     drwav_uint16 translatedFormatTag;
 
+    /*
+    The channel mask, exactly as specified by the file. Will be 0 if the file does not specify one. When a recognized
+    mask is present, decoded audio is reordered into dr_wav's canonical channel order (see the notes at the top of
+    this file). Interpret with the DRWAV_SPEAKER_* flags.
+    */
+    drwav_uint32 channelMask;
+
     /* The total number of PCM frames making up the audio data. */
     drwav_uint64 totalPCMFrameCount;
 
@@ -961,6 +1002,15 @@ typedef struct
         drwav_bool8 isLE;   /* Will be set to true if the audio data is little-endian encoded. */
         drwav_bool8 isUnsigned; /* Only used for 8-bit samples. When set to true, will be treated as unsigned. */
     } aiff;
+
+
+    /*
+    Channel shuffling state. Used internally to reorder channels into dr_wav's canonical channel order based on
+    the channel mask. channelShuffle[i] is the index of the file channel whose samples are output at position i.
+    Do not use these directly.
+    */
+    drwav_uint8 channelShuffle[32];
+    drwav_bool32 isChannelShuffleEnabled;
 } drwav;
 
 
@@ -3154,6 +3204,149 @@ DRWAV_PRIVATE drwav_uint32 drwav_get_bytes_per_pcm_frame(drwav* pWav)
     return bytesPerFrame;
 }
 
+
+DRWAV_PRIVATE drwav_uint32 drwav__count_set_bits(drwav_uint32 x)
+{
+    /* Portable population count. */
+    x = x - ((x >> 1) & 0x55555555);
+    x = (x & 0x33333333) + ((x >> 2) & 0x33333333);
+    x = (x + (x >> 4)) & 0x0F0F0F0F;
+    return (drwav_uint32)((x * 0x01010101) >> 24);
+}
+
+/*
+dr_wav's canonical channel order is:
+
+    FL, FR, BL, BR, FC, LFE, SL, SR, BC, FLC, FRC, TC, TFL, TFC, TFR, TBL, TBC, TBR
+
+The table below maps a speaker position bit index (the DRWAV_SPEAKER_* flags, in bit order) to its rank in the
+canonical order.
+*/
+static const drwav_uint8 drwav__canonical_channel_rank[18] = {
+    0,  /* DRWAV_SPEAKER_FRONT_LEFT */
+    1,  /* DRWAV_SPEAKER_FRONT_RIGHT */
+    4,  /* DRWAV_SPEAKER_FRONT_CENTER */
+    5,  /* DRWAV_SPEAKER_LFE */
+    2,  /* DRWAV_SPEAKER_BACK_LEFT */
+    3,  /* DRWAV_SPEAKER_BACK_RIGHT */
+    9,  /* DRWAV_SPEAKER_FRONT_LEFT_OF_CENTER */
+    10, /* DRWAV_SPEAKER_FRONT_RIGHT_OF_CENTER */
+    8,  /* DRWAV_SPEAKER_BACK_CENTER */
+    6,  /* DRWAV_SPEAKER_SIDE_LEFT */
+    7,  /* DRWAV_SPEAKER_SIDE_RIGHT */
+    11, /* DRWAV_SPEAKER_TOP_CENTER */
+    12, /* DRWAV_SPEAKER_TOP_FRONT_LEFT */
+    13, /* DRWAV_SPEAKER_TOP_FRONT_CENTER */
+    14, /* DRWAV_SPEAKER_TOP_FRONT_RIGHT */
+    15, /* DRWAV_SPEAKER_TOP_BACK_LEFT */
+    16, /* DRWAV_SPEAKER_TOP_BACK_CENTER */
+    17  /* DRWAV_SPEAKER_TOP_BACK_RIGHT */
+};
+
+DRWAV_PRIVATE void drwav__init_channel_shuffle(drwav* pWav)
+{
+    /*
+    Within the file, channels are ordered by channel mask bit position (least significant bit first), as per
+    the WAVE_FORMAT_EXTENSIBLE specification. Here we build a shuffle map to reorder those channels into
+    dr_wav's canonical channel order. channelShuffle[i] will be set to the index of the file channel whose
+    samples should appear at output position i.
+    */
+    drwav_uint8 ranks[32];
+    drwav_uint32 channelCount = 0;
+    drwav_uint32 iBit;
+    drwav_uint32 iChannel;
+
+    pWav->isChannelShuffleEnabled = DRWAV_FALSE;
+
+    /* Files without a channel mask, or with bits set that we don't recognize, are left in their original order. */
+    if (pWav->channelMask == 0 || (pWav->channelMask & ~((drwav_uint32)DRWAV_SPEAKER_ALL)) != 0) {
+        return;
+    }
+
+    /*
+    The mask needs to describe exactly one speaker per channel. Anything else (more speakers than channels,
+    fewer speakers than channels) is ambiguous, so leave those files in their original order.
+    */
+    if (drwav__count_set_bits(pWav->channelMask) != pWav->channels || pWav->channels > 32) {
+        return;
+    }
+
+    /* File channel j corresponds to the j-th set bit of the mask. Collect the canonical rank of each. */
+    for (iBit = 0; iBit < 18; ++iBit) {
+        if (pWav->channelMask & (((drwav_uint32)1) << iBit)) {
+            ranks[channelCount] = drwav__canonical_channel_rank[iBit];
+            channelCount += 1;
+        }
+    }
+
+    /* The output position of each channel is the number of channels with a lower canonical rank. Ranks are unique so there are no ties. */
+    for (iChannel = 0; iChannel < channelCount; ++iChannel) {
+        drwav_uint32 iOut = 0;
+        drwav_uint32 iOther;
+        for (iOther = 0; iOther < channelCount; ++iOther) {
+            if (ranks[iOther] < ranks[iChannel]) {
+                iOut += 1;
+            }
+        }
+        pWav->channelShuffle[iOut] = (drwav_uint8)iChannel;
+    }
+
+    /* Only enable the shuffle if it's actually moving channels around. */
+    for (iChannel = 0; iChannel < channelCount; ++iChannel) {
+        if (pWav->channelShuffle[iChannel] != iChannel) {
+            pWav->isChannelShuffleEnabled = DRWAV_TRUE;
+            break;
+        }
+    }
+}
+
+DRWAV_PRIVATE void drwav__shuffle_channels(drwav* pWav, drwav_uint64 frameCount, drwav_uint32 bytesPerSample, void* pSamples)
+{
+    drwav_uint32 channels;
+    drwav_uint64 iFrame;
+    drwav_uint8* pBytes = (drwav_uint8*)pSamples;
+
+    if (pWav->isChannelShuffleEnabled == DRWAV_FALSE) {
+        return;
+    }
+
+    channels = pWav->channels;
+    if (channels < 2 || channels > 32 || bytesPerSample == 0 || bytesPerSample > 8) {
+        return; /* Should never happen with a valid shuffle map, but stay safe. */
+    }
+
+    /*
+    Apply the shuffle in place, one frame at a time, by walking the cycles of the permutation. The permutation
+    is defined as "output channel i gets the samples of file channel channelShuffle[i]".
+    */
+    for (iFrame = 0; iFrame < frameCount; ++iFrame) {
+        drwav_uint8* pFrame = pBytes + (iFrame * channels * bytesPerSample);
+        drwav_uint32 visited = 0;
+        drwav_uint32 iChannel;
+
+        for (iChannel = 0; iChannel < channels; ++iChannel) {
+            drwav_uint8 temp[8];
+            drwav_uint32 iCur;
+            drwav_uint32 iSrc;
+
+            if ((visited & (((drwav_uint32)1) << iChannel)) != 0 || pWav->channelShuffle[iChannel] == iChannel) {
+                continue;
+            }
+
+            DRWAV_COPY_MEMORY(temp, pFrame + iChannel*bytesPerSample, bytesPerSample);
+            iCur = iChannel;
+            while ((iSrc = pWav->channelShuffle[iCur]) != iChannel) {
+                DRWAV_COPY_MEMORY(pFrame + iCur*bytesPerSample, pFrame + iSrc*bytesPerSample, bytesPerSample);
+                visited |= ((drwav_uint32)1) << iCur;
+                iCur = iSrc;
+            }
+            DRWAV_COPY_MEMORY(pFrame + iCur*bytesPerSample, temp, bytesPerSample);
+            visited |= ((drwav_uint32)1) << iCur;
+        }
+    }
+}
+
+
 DRWAV_API drwav_uint16 drwav_fmt_get_format(const drwav_fmt* pFMT)
 {
     if (pFMT == NULL) {
@@ -3946,6 +4139,10 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     pWav->channels            = fmt.channels;
     pWav->bitsPerSample       = fmt.bitsPerSample;
     pWav->translatedFormatTag = translatedFormatTag;
+    pWav->channelMask         = fmt.channelMask;
+
+    /* Based on the channel mask, set up the mapping that reorders channels into dr_wav's canonical channel order. */
+    drwav__init_channel_shuffle(pWav);
 
     /*
     I've had a report where files would start glitching after seeking. The reason for this is the data
@@ -6063,7 +6260,16 @@ DRWAV_API drwav_uint64 drwav_read_pcm_frames_le(drwav* pWav, drwav_uint64 frames
         return 0;
     }
 
-    return drwav_read_raw(pWav, (size_t)bytesToRead, pBufferOut) / bytesPerFrame;
+    {
+        drwav_uint64 framesRead = drwav_read_raw(pWav, (size_t)bytesToRead, pBufferOut) / bytesPerFrame;
+
+        /* Reorder channels into dr_wav's canonical channel order if the file specified a recognized channel mask. */
+        if (pBufferOut != NULL && framesRead > 0 && (bytesPerFrame % pWav->channels) == 0) {
+            drwav__shuffle_channels(pWav, framesRead, bytesPerFrame / pWav->channels, pBufferOut);
+        }
+
+        return framesRead;
+    }
 }
 
 DRWAV_API drwav_uint64 drwav_read_pcm_frames_be(drwav* pWav, drwav_uint64 framesToRead, void* pBufferOut)
@@ -7168,11 +7374,15 @@ DRWAV_API drwav_uint64 drwav_read_pcm_frames_s16(drwav* pWav, drwav_uint64 frame
     }
 
     if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM) {
-        return drwav_read_pcm_frames_s16__msadpcm(pWav, framesToRead, pBufferOut);
+        drwav_uint64 framesRead = drwav_read_pcm_frames_s16__msadpcm(pWav, framesToRead, pBufferOut);
+        drwav__shuffle_channels(pWav, framesRead, sizeof(drwav_int16), pBufferOut);
+        return framesRead;
     }
 
     if (pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
-        return drwav_read_pcm_frames_s16__ima(pWav, framesToRead, pBufferOut);
+        drwav_uint64 framesRead = drwav_read_pcm_frames_s16__ima(pWav, framesToRead, pBufferOut);
+        drwav__shuffle_channels(pWav, framesRead, sizeof(drwav_int16), pBufferOut);
+        return framesRead;
     }
 
     return 0;
