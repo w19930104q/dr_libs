@@ -960,6 +960,15 @@ typedef struct
     {
         drwav_bool8 isLE;   /* Will be set to true if the audio data is little-endian encoded. */
         drwav_bool8 isUnsigned; /* Only used for 8-bit samples. When set to true, will be treated as unsigned. */
+
+        /*
+        Sequential mode only. Used when the SSND chunk is encountered before the COMM chunk. In that situation the
+        audio data is buffered while we keep scanning for the COMM chunk. Once found, playback starts from this buffer
+        before falling back to the stream. Will be NULL when not in use. pSequentialReplayData is freed in drwav_uninit().
+        */
+        drwav_uint8* pSequentialReplayData;
+        size_t sequentialReplayDataSize;
+        size_t sequentialReplayDataCursor;
     } aiff;
 } drwav;
 
@@ -3207,6 +3216,10 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     drwav_uint64 aiffFrameCount = 0;
     drwav_int64 fileSize = 0;
     drwav_bool32 hasKnownFileSize = DRWAV_FALSE;
+    drwav_bool32 aiffSequentialReplayActive = DRWAV_FALSE;  /* Sequential AIFF: SSND was found before COMM. */
+    drwav_uint64 aiffSequentialDataSize = 0;               /* Number of buffered audio bytes (excludes the SSND offset). */
+    drwav_uint32 aiffSequentialOffset = 0;                /* SSND offset that still needs to be skipped after COMM is found. */
+    drwav_bool32 ownsMetadataParserBuffer = DRWAV_FALSE;  /* Whether metadataParser.pMetadata still needs freeing on the error path. */
 
     cursor = 0;
     sequential = (flags & DRWAV_SEQUENTIAL) != 0;
@@ -3446,7 +3459,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             */
             if (callbackBytesRead > 0) {
                 if (drwav__seek_from_start(pWav->onSeek, cursor, pWav->pUserData) == DRWAV_FALSE) {
-                    return DRWAV_FALSE;
+                    goto error;
                 }
             }
         }
@@ -3460,13 +3473,13 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             drwav_uint8 fmtData[16];
 
             if (header.sizeInBytes < sizeof(fmtData)) {
-                return DRWAV_FALSE; /* Invalid fmt chunk. */
+                goto error; /* Invalid fmt chunk. */
             }
 
             foundChunk_fmt = DRWAV_TRUE;
 
             if (pWav->onRead(pWav->pUserData, fmtData, sizeof(fmtData)) != sizeof(fmtData)) {
-                return DRWAV_FALSE;
+                goto error;
             }
             cursor += sizeof(fmtData);
 
@@ -3488,7 +3501,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 drwav_uint64 leftoverBytes;
 
                 if (pWav->onRead(pWav->pUserData, fmt_cbSize, sizeof(fmt_cbSize)) != sizeof(fmt_cbSize)) {
-                    return DRWAV_FALSE;    /* Expecting more data. */
+                    goto error;    /* Expecting more data. */
                 }
                 cursor += sizeof(fmt_cbSize);
 
@@ -3499,7 +3512,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                     /* Simple validation. */
                     if (fmt.formatTag == DR_WAVE_FORMAT_EXTENSIBLE) {
                         if (fmt.extendedSize != 22) {
-                            return DRWAV_FALSE;
+                            goto error;
                         }
                     }
 
@@ -3507,7 +3520,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                         drwav_uint8 fmtext[22];
 
                         if (pWav->onRead(pWav->pUserData, fmtext, fmt.extendedSize) != fmt.extendedSize) {
-                            return DRWAV_FALSE;    /* Expecting more data. */
+                            goto error;    /* Expecting more data. */
                         }
 
                         fmt.validBitsPerSample = drwav_bytes_to_u16_ex(fmtext + 0, pWav->container);
@@ -3515,7 +3528,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                         drwav_bytes_to_guid(fmtext + 6, fmt.subFormat);
                     } else {
                         if (pWav->onSeek(pWav->pUserData, fmt.extendedSize, DRWAV_SEEK_CUR) == DRWAV_FALSE) {
-                            return DRWAV_FALSE;
+                            goto error;
                         }
                     }
                     cursor += fmt.extendedSize;
@@ -3526,11 +3539,11 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 /* Seek past any leftover bytes. For w64 the leftover will be defined based on the chunk size. */
                 leftoverBytes = header.sizeInBytes - bytesReadSoFar;
                 if (leftoverBytes > 0x7FFFFFFF) {
-                    return DRWAV_FALSE;
+                    goto error;
                 }
 
                 if (pWav->onSeek(pWav->pUserData, (int)leftoverBytes, DRWAV_SEEK_CUR) == DRWAV_FALSE) {
-                    return DRWAV_FALSE;
+                    goto error;
                 }
 
                 cursor += leftoverBytes;
@@ -3579,11 +3592,11 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 drwav_uint8 sampleCount[4];
 
                 if (chunkSize < 4) {
-                    return DRWAV_FALSE;
+                    goto error;
                 }
 
                 if (drwav__on_read(pWav->onRead, pWav->pUserData, &sampleCount, 4, &cursor) != 4) {
-                    return DRWAV_FALSE;
+                    goto error;
                 }
 
                 chunkSize -= 4;
@@ -3593,11 +3606,11 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                 drwav_uint8 sampleCount[8];
 
                 if (chunkSize < sizeof(sampleCount)) {
-                    return DRWAV_FALSE;
+                    goto error;
                 }
 
                 if (drwav__on_read(pWav->onRead, pWav->pUserData, sampleCount, sizeof(sampleCount), &cursor) != sizeof(sampleCount)) {
-                    return DRWAV_FALSE;
+                    goto error;
                 }
 
                 chunkSize -= sizeof(sampleCount);
@@ -3632,17 +3645,17 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             if (isAIFCFormType) {
                 commDataBytesToRead = 24;
                 if (header.sizeInBytes < commDataBytesToRead) {
-                    return DRWAV_FALSE; /* Invalid COMM chunk. */
+                    goto error; /* Invalid COMM chunk. */
                 }
             } else {
                 commDataBytesToRead = 18;
                 if (header.sizeInBytes != commDataBytesToRead) {
-                    return DRWAV_FALSE; /* INVALID COMM chunk. */
+                    goto error; /* INVALID COMM chunk. */
                 }
             }
 
             if (drwav__on_read(pWav->onRead, pWav->pUserData, commData, commDataBytesToRead, &cursor) != commDataBytesToRead) {
-                return DRWAV_FALSE;
+                goto error;
             }
 
 
@@ -3652,7 +3665,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             sampleRate       = drwav_aiff_extended_to_s64(commData + 8);
 
             if (sampleRate < 0 || sampleRate > 0xFFFFFFFF) {
-                return DRWAV_FALSE; /* Invalid sample rate. */
+                goto error; /* Invalid sample rate. */
             }
 
             if (isAIFCFormType) {
@@ -3687,9 +3700,9 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                     (void)compressionFormat;
                     (void)sampleSizeInBits;
 
-                    return DRWAV_FALSE;
+                    goto error;
                 } else {
-                    return DRWAV_FALSE; /* Unknown or unsupported compression format. Need to abort. */
+                    goto error; /* Unknown or unsupported compression format. Need to abort. */
                 }
             } else {
                 compressionFormat = DR_WAVE_FORMAT_PCM; /* It's a standard AIFF form which is always compressed. */
@@ -3720,7 +3733,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             /* If the form type is AIFC there will be some additional data in the chunk. We need to seek past it. */
             if (isAIFCFormType) {
                 if (drwav__seek_forward(pWav->onSeek, (chunkSize - commDataBytesToRead), pWav->pUserData) == DRWAV_FALSE) {
-                    return DRWAV_FALSE;
+                    goto error;
                 }
                 cursor += (chunkSize - commDataBytesToRead);
             }
@@ -3738,7 +3751,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             foundChunk_data = DRWAV_TRUE;
 
             if (drwav__on_read(pWav->onRead, pWav->pUserData, offsetAndBlockSizeData, sizeof(offsetAndBlockSizeData), &cursor) != sizeof(offsetAndBlockSizeData)) {
-                return DRWAV_FALSE;
+                goto error;
             }
 
             /* The position of the audio data starts at an offset. */
@@ -3764,18 +3777,72 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
                     so we're left sitting on the first byte of actual audio data.
                     */
                     if (drwav__seek_forward(pWav->onSeek, offset, pWav->pUserData) == DRWAV_FALSE) {
-                        return DRWAV_FALSE;
+                        goto error;
                     }
                     cursor += offset;
 
                     break;
                 } else {
                     /*
-                    Getting here means the COMM chunk was not found. In sequential mode, if we haven't yet found the COMM chunk
-                    we'll need to abort because we can't be doing a backwards seek back to the SSND chunk in order to read the
-                    data. For this reason, this configuration of AIFF files are not supported with sequential mode.
+                    The COMM chunk has not been encountered yet. In a strictly sequential stream we cannot seek backwards to re-read
+                    the SSND data once we've scanned past it, so instead we buffer the audio data while we keep scanning for the COMM
+                    chunk. Once COMM is found the buffered data is replayed through pWav->aiff.pSequentialReplayData before falling
+                    back to reading directly from the stream.
+
+                    The SSND offset cannot be skipped with a seek because it sits in the middle of the bytes we need to consume, so it
+                    is consumed as part of the buffering below.
                     */
-                    return DRWAV_FALSE;
+                    drwav_uint64 bytesToBuffer;
+
+                    aiffSequentialReplayActive = DRWAV_TRUE;
+                    aiffSequentialOffset       = offset;
+
+                    /*
+                    Cap the amount of buffered data. A SSND chunk placed before COMM should only ever hold the actual audio, so a
+                    gigabyte is already far beyond anything reasonable; anything larger is treated as a malformed file rather than
+                    risk an unbounded allocation against untrusted data.
+                    */
+                    if (dataChunkSize > 0x40000000) {
+                        goto error;
+                    }
+
+                    /*
+                    Everything between the current stream position (just past the 8-byte offset/block-size header) and the end of
+                    the SSND chunk needs to be buffered: the SSND offset bytes followed by the audio data itself. This leaves the
+                    stream positioned exactly on the next chunk header.
+                    */
+                    if (chunkSize < sizeof(offsetAndBlockSizeData) || (chunkSize - sizeof(offsetAndBlockSizeData)) < offset) {
+                        goto error; /* Malformed SSND chunk: the declared offset does not fit inside the chunk. */
+                    }
+
+                    bytesToBuffer = chunkSize - sizeof(offsetAndBlockSizeData);
+                    if (bytesToBuffer > DRWAV_SIZE_MAX) {
+                        goto error;
+                    }
+
+                    pWav->aiff.pSequentialReplayData = (drwav_uint8*)drwav__malloc_from_callbacks((size_t)bytesToBuffer, &pWav->allocationCallbacks);
+                    if (pWav->aiff.pSequentialReplayData == NULL) {
+                        goto error;
+                    }
+
+                    if (drwav__on_read(pWav->onRead, pWav->pUserData, pWav->aiff.pSequentialReplayData, (size_t)bytesToBuffer, &cursor) != (size_t)bytesToBuffer) {
+                        goto error;
+                    }
+
+                    pWav->aiff.sequentialReplayDataSize   = (size_t)bytesToBuffer;
+                    pWav->aiff.sequentialReplayDataCursor = 0;
+                    aiffSequentialDataSize                 = dataChunkSize;
+
+                    /* Skip the chunk's padding byte, if any, so we're positioned on the next chunk header. */
+                    if (header.paddingSize > 0) {
+                        if (drwav__seek_forward(pWav->onSeek, header.paddingSize, pWav->pUserData) == DRWAV_FALSE) {
+                            goto error;
+                        }
+                        cursor += header.paddingSize;
+                    }
+
+                    /* Keep scanning for the COMM chunk. */
+                    continue;
                 }
             } else {
                 chunkSize += header.paddingSize;                /* <-- Make sure we seek past the padding. */
@@ -3794,7 +3861,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         /* Getting here means it's not a chunk that we care about internally, but might need to be handled as metadata by the caller. */
         if (isProcessingMetadata) {
             if (hasKnownFileSize && header.sizeInBytes > (drwav_uint64)fileSize) {
-                return DRWAV_FALSE;
+                goto error;
             }
 
             drwav__metadata_process_chunk(&metadataParser, &header, drwav_metadata_type_all_including_unknown);
@@ -3816,7 +3883,30 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
 
     /* There's some mandatory chunks that must exist. If they were not found in the iteration above we must abort. */
     if (!foundChunk_fmt || !foundChunk_data) {
-        return DRWAV_FALSE;
+        goto error;
+    }
+
+    /*
+    Sequential AIFF with the SSND chunk placed before the COMM chunk. The audio data was buffered while scanning for the
+    COMM chunk. The underlying stream now sits on the first byte after the SSND chunk, so seeking to dataChunkDataPos would
+    be a backwards seek which is not allowed in sequential mode. Instead the buffered data is replayed first; the replay
+    cursor is advanced past the SSND offset below so playback begins on the first real audio byte.
+    */
+    if (aiffSequentialReplayActive) {
+        if (aiffSequentialOffset >= pWav->aiff.sequentialReplayDataSize) {
+            goto error; /* Malformed SSND offset. */
+        }
+
+        pWav->aiff.sequentialReplayDataCursor = aiffSequentialOffset;
+
+        /*
+        The buffered bytes cover the whole SSND payload, so the data size is known regardless of what the (untrusted) chunk
+        header reported. Keep using the header-derived value for consistency with the random-access path, but bounded to what
+        was actually buffered.
+        */
+        if (dataChunkSize > aiffSequentialDataSize) {
+            dataChunkSize = aiffSequentialDataSize;
+        }
     }
 
     /* Basic validation. */
@@ -3824,7 +3914,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         (fmt.channels      == 0 || fmt.channels      > DRWAV_MAX_CHANNELS       ) ||
         (fmt.bitsPerSample == 0 || fmt.bitsPerSample > DRWAV_MAX_BITS_PER_SAMPLE) ||
         fmt.blockAlign == 0) {
-        return DRWAV_FALSE; /* Probably an invalid WAV file. */
+        goto error; /* Probably an invalid WAV file. */
     }
 
     /* Translate the internal format. */
@@ -3841,7 +3931,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     /* We may have moved passed the data chunk. If so we need to move back. If running in sequential mode we can assume we are already sitting on the data chunk. */
     if (!sequential) {
         if (!drwav__seek_from_start(pWav->onSeek, pWav->dataChunkDataPos, pWav->pUserData)) {
-            return DRWAV_FALSE;
+            goto error;
         }
         cursor = pWav->dataChunkDataPos;
     }
@@ -3856,13 +3946,14 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     */
     if (isProcessingMetadata && metadataParser.metadataCount > 0) {
         if (drwav__seek_from_start(pWav->onSeek, metadataStartPos, pWav->pUserData) == DRWAV_FALSE) {
-            return DRWAV_FALSE;
+            goto error;
         }
 
         result = drwav__metadata_alloc(&metadataParser, &pWav->allocationCallbacks);
         if (result != DRWAV_SUCCESS) {
-            return DRWAV_FALSE;
+            goto error;
         }
+        ownsMetadataParserBuffer = DRWAV_TRUE;
 
         metadataParser.stage = drwav__metadata_parser_stage_read;
 
@@ -3884,13 +3975,15 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             /* Move to the end of the chunk so we can keep iterating. */
             if (drwav__seek_forward(pWav->onSeek, (header.sizeInBytes + header.paddingSize) - metadataBytesRead, pWav->pUserData) == DRWAV_FALSE) {
                 drwav_free(metadataParser.pMetadata, &pWav->allocationCallbacks);
-                return DRWAV_FALSE;
+                ownsMetadataParserBuffer = DRWAV_FALSE;  /* Freed above; the error label must not free it again. */
+                goto error;
             }
         }
 
         /* Only return metadata objects that were fully parsed. */
         pWav->pMetadata     = metadataParser.pMetadata;
         pWav->metadataCount = (drwav_uint32)metadataParser.metadataCursor;
+        ownsMetadataParserBuffer = DRWAV_FALSE;  /* Ownership has moved to pWav->pMetadata. */
     }
 
     /*
@@ -3934,10 +4027,13 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
         }
     }
 
-    /* At this point we want to be sitting on the first byte of the raw audio data. */
-    if (drwav__seek_from_start(pWav->onSeek, pWav->dataChunkDataPos, pWav->pUserData) == DRWAV_FALSE) {
-        drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
-        return DRWAV_FALSE;
+    /*
+    At this point we want to be sitting on the first byte of the raw audio data. In sequential mode the stream is already
+    positioned there (or, for an AIFF with SSND before COMM, the buffered replay data takes over), so an absolute seek would
+    either be redundant or illegal for forward-only backends such as pipes.
+    */
+    if (!sequential && drwav__seek_from_start(pWav->onSeek, pWav->dataChunkDataPos, pWav->pUserData) == DRWAV_FALSE) {
+        goto error;
     }
 
 
@@ -3974,8 +4070,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     } else {
         drwav_uint32 bytesPerFrame = drwav_get_bytes_per_pcm_frame(pWav);
         if (bytesPerFrame == 0) {
-            drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
-            return DRWAV_FALSE; /* Invalid file. */
+            goto error; /* Invalid file. */
         }
 
         pWav->totalPCMFrameCount = dataChunkSize / bytesPerFrame;
@@ -3992,8 +4087,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             /* We decode two samples per byte. There will be blockCount headers in the data chunk. This is enough to know how to calculate the total PCM frame count. */
             totalBlockHeaderSizeInBytes = blockCount * (6*fmt.channels);
             if (totalBlockHeaderSizeInBytes >= dataChunkSize) {  /* <-- We'll be subtracting totalBlockHeaderSizeInBytes from dataChunkSize next so it must be validated. */
-                drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
-                return DRWAV_FALSE; /* Invalid file. */
+                goto error; /* Invalid file. */
             }
 
             pWav->totalPCMFrameCount = ((dataChunkSize - totalBlockHeaderSizeInBytes) * 2) / fmt.channels;
@@ -4010,8 +4104,7 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
             /* We decode two samples per byte. There will be blockCount headers in the data chunk. This is enough to know how to calculate the total PCM frame count. */
             totalBlockHeaderSizeInBytes = blockCount * (4*fmt.channels);
             if (totalBlockHeaderSizeInBytes >= dataChunkSize) {  /* <-- We'll be subtracting totalBlockHeaderSizeInBytes from dataChunkSize next so it must be validated. */
-                drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
-                return DRWAV_FALSE; /* Invalid file. */
+                goto error; /* Invalid file. */
             }
 
             pWav->totalPCMFrameCount = ((dataChunkSize - totalBlockHeaderSizeInBytes) * 2) / fmt.channels;
@@ -4024,18 +4117,30 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     /* Some formats only support a certain number of channels. */
     if (pWav->translatedFormatTag == DR_WAVE_FORMAT_ADPCM || pWav->translatedFormatTag == DR_WAVE_FORMAT_DVI_ADPCM) {
         if (pWav->channels > 2) {
-            drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
-            return DRWAV_FALSE;
+            goto error;
         }
     }
 
     /* The number of bytes per frame must be known. If not, it's an invalid file and not decodable. */
     if (drwav_get_bytes_per_pcm_frame(pWav) == 0) {
-        drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
-        return DRWAV_FALSE;
+        goto error;
     }
 
     return DRWAV_TRUE;
+
+error:
+    /*
+    The metadata parser owns its buffer until it's handed over to pWav->pMetadata. If a failure (including a break out of the
+    second-pass loop) happens before that handover, ownsMetadataParserBuffer is still true and the buffer must be freed here.
+    After handover it is false and the same allocation is reachable through pWav->pMetadata instead, so it is freed exactly once.
+    */
+    if (ownsMetadataParserBuffer) {
+        drwav_free(metadataParser.pMetadata, &pWav->allocationCallbacks);
+    }
+    drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
+    drwav_free(pWav->aiff.pSequentialReplayData, &pWav->allocationCallbacks);
+    pWav->aiff.pSequentialReplayData = NULL;
+    return DRWAV_FALSE;
 }
 
 DRWAV_API drwav_bool32 drwav_init(drwav* pWav, drwav_read_proc onRead, drwav_seek_proc onSeek, drwav_tell_proc onTell, void* pUserData, const drwav_allocation_callbacks* pAllocationCallbacks)
@@ -5941,6 +6046,8 @@ DRWAV_API drwav_result drwav_uninit(drwav* pWav)
         }
     } else {
         drwav_free(pWav->pMetadata, &pWav->allocationCallbacks);
+        drwav_free(pWav->aiff.pSequentialReplayData, &pWav->allocationCallbacks);
+        pWav->aiff.pSequentialReplayData = NULL;
     }
 
 #ifndef DR_WAV_NO_STDIO
@@ -5957,6 +6064,37 @@ DRWAV_API drwav_result drwav_uninit(drwav* pWav)
 }
 
 
+
+DRWAV_PRIVATE size_t drwav__read_sequential_replay(drwav* pWav, size_t bytesToRead, void* pBufferOut)
+{
+    /*
+    Used in sequential mode only, when an AIFF's SSND chunk was encountered before its COMM chunk and the audio data had to be
+    buffered. Drains the replay buffer first; once exhausted all further reads go straight through to the client stream. Returns
+    the number of bytes satisfied from the buffer (which may be zero).
+    */
+    size_t bytesAvailable;
+    size_t bytesFromBuffer;
+
+    if (pWav->aiff.pSequentialReplayData == NULL) {
+        return 0;
+    }
+
+    bytesAvailable = pWav->aiff.sequentialReplayDataSize - pWav->aiff.sequentialReplayDataCursor;
+    if (bytesAvailable == 0) {
+        return 0;
+    }
+
+    bytesFromBuffer = bytesToRead < bytesAvailable ? bytesToRead : bytesAvailable;
+
+    if (pBufferOut != NULL) {
+        drwav_uint8* pDst = (drwav_uint8*)pBufferOut;
+        DRWAV_COPY_MEMORY(pDst, pWav->aiff.pSequentialReplayData + pWav->aiff.sequentialReplayDataCursor, bytesFromBuffer);
+    }
+    /* A NULL buffer means the caller is skipping; just advance the replay cursor. */
+
+    pWav->aiff.sequentialReplayDataCursor += bytesFromBuffer;
+    return bytesFromBuffer;
+}
 
 DRWAV_API size_t drwav_read_raw(drwav* pWav, size_t bytesToRead, void* pBufferOut)
 {
@@ -5980,39 +6118,49 @@ DRWAV_API size_t drwav_read_raw(drwav* pWav, size_t bytesToRead, void* pBufferOu
         return 0;   /* Could not determine the bytes per frame. */
     }
 
-    if (pBufferOut != NULL) {
-        bytesRead = pWav->onRead(pWav->pUserData, pBufferOut, bytesToRead);
-    } else {
-        /* We need to seek. If we fail, we need to read-and-discard to make sure we get a good byte count. */
-        bytesRead = 0;
-        while (bytesRead < bytesToRead) {
-            size_t bytesToSeek = (bytesToRead - bytesRead);
-            if (bytesToSeek > 0x7FFFFFFF) {
-                bytesToSeek = 0x7FFFFFFF;
+    /* Sequential AIFF replay: satisfy as much as possible from the buffered SSND data first. */
+    bytesRead = drwav__read_sequential_replay(pWav, bytesToRead, pBufferOut);
+    if (bytesRead < bytesToRead) {
+        size_t bytesRemainingToRead = bytesToRead - bytesRead;
+
+        if (pBufferOut != NULL) {
+            drwav_uint8* pDst = (drwav_uint8*)pBufferOut;
+            size_t bytesJustRead = pWav->onRead(pWav->pUserData, pDst + bytesRead, bytesRemainingToRead);
+            bytesRead += bytesJustRead;
+        } else {
+            /* We need to seek. If we fail, we need to read-and-discard to make sure we get a good byte count. */
+            size_t bytesSkipped = 0;
+            while (bytesSkipped < bytesRemainingToRead) {
+                size_t bytesToSeek = (bytesRemainingToRead - bytesSkipped);
+                if (bytesToSeek > 0x7FFFFFFF) {
+                    bytesToSeek = 0x7FFFFFFF;
+                }
+
+                if (pWav->onSeek(pWav->pUserData, (int)bytesToSeek, DRWAV_SEEK_CUR) == DRWAV_FALSE) {
+                    break;
+                }
+
+                bytesSkipped += bytesToSeek;
             }
 
-            if (pWav->onSeek(pWav->pUserData, (int)bytesToSeek, DRWAV_SEEK_CUR) == DRWAV_FALSE) {
-                break;
+            /* When we get here we may need to read-and-discard some data. */
+            while (bytesSkipped < bytesRemainingToRead) {
+                drwav_uint8 buffer[4096];
+                size_t bytesSeeked;
+                size_t bytesToSeek = (bytesRemainingToRead - bytesSkipped);
+                if (bytesToSeek > sizeof(buffer)) {
+                    bytesToSeek = sizeof(buffer);
+                }
+
+                bytesSeeked = pWav->onRead(pWav->pUserData, buffer, bytesToSeek);
+                bytesSkipped += bytesSeeked;
+
+                if (bytesSeeked < bytesToSeek) {
+                    break;  /* Reached the end. */
+                }
             }
 
-            bytesRead += bytesToSeek;
-        }
-
-        /* When we get here we may need to read-and-discard some data. */
-        while (bytesRead < bytesToRead) {
-            drwav_uint8 buffer[4096];
-            size_t bytesSeeked;
-            size_t bytesToSeek = (bytesToRead - bytesRead);
-            if (bytesToSeek > sizeof(buffer)) {
-                bytesToSeek = sizeof(buffer);
-            }
-
-            bytesSeeked = pWav->onRead(pWav->pUserData, buffer, bytesToSeek);
-            bytesRead += bytesSeeked;
-
-            if (bytesSeeked < bytesToSeek) {
-                break;  /* Reached the end. */
-            }
+            bytesRead += bytesSkipped;
         }
     }
 
